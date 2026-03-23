@@ -1,0 +1,38 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "plunger-proxy"
+version = "0.1.0"
+description = "Zero-config resilient proxy for Claude-compatible streaming APIs"
+readme = "README.md"
+license = "MIT"
+requires-python = ">=3.10"
+authors = [
+    { name = "maou" },
+]
+keywords = ["claude", "proxy", "streaming", "resilient", "plunger", "api"]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Intended Audience :: Developers",
+    "License :: OSI Approved :: MIT License",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Topic :: Internet :: Proxy Servers",
+    "Topic :: Software Development :: Libraries",
+]
+dependencies = [
+    "aiohttp>=3.9",
+]
+
+[project.urls]
+Homepage = "https://github.com/maouzju/plunger"
+Repository = "https://github.com/maouzju/plunger"
+Issues = "https://github.com/maouzju/plunger/issues"
+
+[project.scripts]
+plunger-proxy = "plunger:main"

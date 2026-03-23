@@ -1,0 +1,34 @@
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+
+# PyInstaller build artifacts
+build/
+dist/
+*.spec
+
+# Runtime logs
+*.log
+*.err.log
+*.out.log
+
+# Test temp directories & caches
+.pytest_cache/
+pytest-cache-files-*/
+.tmp-home*/
+.tmp-test*/
+.tmp-recovery-test/
+.tmp-takeover*/
+.tmp-ui-shutdown-check-*/
+tmp*/
+
+# Claude Code (developer tool config)
+.claude/
+
+# pip local
+pip/
+
+# OS files
+Thumbs.db
+.DS_Store
