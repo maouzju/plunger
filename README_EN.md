@@ -49,9 +49,15 @@ Plunger 🪠 sits between your AI client and the Anthropic API. When a streaming
 
 ### Windows Users
 
-Download the exe and double-click to run — no Python installation required:
+Download the Windows release archive, extract it, and double-click `Plunger.exe` — no Python installation required:
 
-👉 [**Download Plunger.exe**](https://github.com/maouzju/plunger/releases/latest)
+👉 [**Download the Windows release**](https://github.com/maouzju/plunger/releases/latest)
+
+If Windows SmartScreen blocks the extracted files on first launch, that is the usual trust warning for unsigned internet downloads. You can either click `More info` -> `Run anyway`, or remove the download marker in PowerShell:
+
+```powershell
+Get-ChildItem "$env:USERPROFILE\Downloads\Plunger\*" -Recurse | Unblock-File -ErrorAction SilentlyContinue
+```
 
 ### From Source
 

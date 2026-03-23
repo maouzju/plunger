@@ -4,12 +4,14 @@
 from __future__ import annotations
 
 import argparse
+import asyncio
 import json
 import logging
 import os
 import re
 import subprocess
 import sys
+import threading
 import time
 import tkinter as tk
 from contextlib import suppress
@@ -729,6 +731,53 @@ class FancyButton(tk.Canvas):
             self._command()
 
 
+class EmbeddedProxyProcess:
+    """Run the proxy inside a background thread for frozen single-file builds."""
+
+    def __init__(self, cli_args: list[str], *, base_url: str) -> None:
+        self._cli_args = list(cli_args)
+        self._base_url = base_url.rstrip("/")
+        self._exit_code: int | None = None
+        self._thread = threading.Thread(
+            target=self._run,
+            name="plunger-embedded-proxy",
+            daemon=True,
+        )
+
+    def start(self) -> None:
+        self._thread.start()
+
+    def poll(self) -> int | None:
+        if self._thread.is_alive():
+            return None
+        return 0 if self._exit_code is None else self._exit_code
+
+    def wait(self, timeout: float | None = None) -> int:
+        self._thread.join(timeout)
+        if self._thread.is_alive():
+            raise subprocess.TimeoutExpired("embedded-proxy", timeout or 0.0)
+        return 0 if self._exit_code is None else self._exit_code
+
+    def terminate(self) -> None:
+        request = Request(f"{self._base_url}/control/shutdown", method="POST")
+        with suppress(Exception):
+            with LOCAL_OPENER.open(request, timeout=1.2) as response:
+                response.read()
+
+    def _run(self) -> None:
+        try:
+            from plunger import build_arg_parser as build_proxy_arg_parser, run_proxy
+
+            proxy_args = build_proxy_arg_parser().parse_args(self._cli_args)
+            self._exit_code = int(asyncio.run(run_proxy(proxy_args)))
+        except SystemExit as exc:
+            code = exc.code if isinstance(exc.code, int) else 0
+            self._exit_code = int(code)
+        except Exception:
+            log.exception("Embedded proxy thread crashed")
+            self._exit_code = 1
+
+
 class ProxyDashboard:
     def __init__(self, root: tk.Tk, args: argparse.Namespace) -> None:
         self.root = root
@@ -738,7 +787,7 @@ class ProxyDashboard:
         self.root._proxy_dashboard = self  # type: ignore[attr-defined]
         self.args = args
         self.base_url = f"http://127.0.0.1:{args.port}"
-        self.process: subprocess.Popen[bytes] | None = None
+        self.process: subprocess.Popen[bytes] | EmbeddedProxyProcess | None = None
         self.after_id: str | None = None
         self.pending_action: str | None = None
         self.pending_deadline = 0.0
@@ -776,6 +825,21 @@ class ProxyDashboard:
         self._refresh_state()
         self._schedule_refresh()
         self.root.after(220, self._maybe_auto_start_proxy)
+
+    def _build_proxy_cli_args(self) -> list[str]:
+        cli_args = [
+            "--port",
+            str(self.args.port),
+            "--timeout",
+            str(self.args.timeout),
+            "--retries",
+            str(self.args.retries),
+            "--watch-interval",
+            str(self.args.watch_interval),
+        ]
+        if self.args.upstream:
+            cli_args.extend(["--upstream", self.args.upstream])
+        return cli_args
 
     def _load_ui_settings(self) -> dict[str, Any]:
         if not UI_SETTINGS_FILE.exists():
@@ -1508,35 +1572,25 @@ class ProxyDashboard:
         previous_health = self._fetch_health()
         self.pending_start_previous_started_at_ms = self._extract_started_at_ms(previous_health)
         if _is_frozen_app():
-            command = [sys.executable, "--headless"]
+            self.process = EmbeddedProxyProcess(
+                self._build_proxy_cli_args(),
+                base_url=self.base_url,
+            )
+            self.process.start()
         else:
             command = [sys.executable, str(Path(__file__).with_name("plunger.py"))]
-        command.extend(
-            [
-                "--port",
-                str(self.args.port),
-                "--timeout",
-                str(self.args.timeout),
-                "--retries",
-                str(self.args.retries),
-                "--watch-interval",
-                str(self.args.watch_interval),
-            ]
-        )
-        if self.args.upstream:
-            command.extend(["--upstream", self.args.upstream])
+            command.extend(self._build_proxy_cli_args())
+            creationflags = 0
+            for flag_name in ("CREATE_NO_WINDOW", "CREATE_NEW_PROCESS_GROUP"):
+                creationflags |= getattr(subprocess, flag_name, 0)
 
-        creationflags = 0
-        for flag_name in ("CREATE_NO_WINDOW", "CREATE_NEW_PROCESS_GROUP"):
-            creationflags |= getattr(subprocess, flag_name, 0)
-
-        self.process = subprocess.Popen(
-            command,
-            cwd=str(_app_base_dir()),
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL,
-            creationflags=creationflags,
-        )
+            self.process = subprocess.Popen(
+                command,
+                cwd=str(_app_base_dir()),
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                creationflags=creationflags,
+            )
         self.pending_action = "start"
         self.pending_deadline = time.time() + (
             20.0 if self.pending_start_previous_started_at_ms is not None else 12.0

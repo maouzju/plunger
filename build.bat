@@ -18,21 +18,25 @@ echo [3/4] Installing PyInstaller...
 "%PYTHON_EXE%" %PYTHON_ARGS% -m pip install --disable-pip-version-check pyinstaller
 if errorlevel 1 goto :build_failed
 
-echo [4/4] Building dist\Plunger.exe ...
+echo [4/4] Building dist\Plunger\Plunger.exe ...
 "%PYTHON_EXE%" %PYTHON_ARGS% -m PyInstaller --noconfirm --clean "resilient-proxy.spec"
 if errorlevel 1 goto :build_failed
 
-if exist "dist\Plunger.exe" (
+if exist "dist\Plunger\Plunger.exe" (
+    if exist "dist\Plunger-windows.zip" del /f /q "dist\Plunger-windows.zip" >nul 2>nul
+    powershell -NoProfile -Command "Compress-Archive -Path 'dist\\Plunger\\*' -DestinationPath 'dist\\Plunger-windows.zip' -Force"
+    if errorlevel 1 goto :build_failed
     echo.
     echo Build completed successfully:
-    echo %CD%\dist\Plunger.exe
+    echo %CD%\dist\Plunger\Plunger.exe
+    echo %CD%\dist\Plunger-windows.zip
     echo.
     pause
     exit /b 0
 )
 
 echo.
-echo Build finished, but dist\Plunger.exe was not found.
+echo Build finished, but dist\Plunger\Plunger.exe was not found.
 goto :build_failed
 
 :find_python

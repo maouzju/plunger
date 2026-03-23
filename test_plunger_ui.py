@@ -1,4 +1,5 @@
 import subprocess
+from argparse import Namespace
 
 import plunger_ui
 
@@ -133,3 +134,67 @@ def test_write_gui_state_is_best_effort(monkeypatch) -> None:
     monkeypatch.setattr(plunger_ui, "RECOVERY_DIR", StubRecoveryDir())
 
     plunger_ui._write_gui_state()
+
+
+def test_start_proxy_uses_embedded_runner_for_frozen_build(monkeypatch) -> None:
+    created: list[FakeEmbeddedProcess] = []
+
+    class FakeEmbeddedProcess:
+        def __init__(self, cli_args: list[str], *, base_url: str) -> None:
+            self.cli_args = cli_args
+            self.base_url = base_url
+            self.started = False
+            created.append(self)
+
+        def start(self) -> None:
+            self.started = True
+
+        def poll(self) -> int | None:
+            return None
+
+    dashboard = object.__new__(plunger_ui.ProxyDashboard)
+    dashboard.args = Namespace(
+        port=8462,
+        timeout=60.0,
+        retries=-1,
+        watch_interval=1.0,
+        upstream=None,
+    )
+    dashboard.base_url = "http://127.0.0.1:8462"
+    dashboard.process = None
+    dashboard.pending_action = None
+    dashboard.pending_deadline = 0.0
+    dashboard.pending_start_previous_started_at_ms = None
+    dashboard._fetch_health = lambda: None
+    dashboard._stop_existing_proxy_before_start = lambda previous_started_at_ms: None
+    dashboard._extract_started_at_ms = plunger_ui.ProxyDashboard._extract_started_at_ms.__get__(
+        dashboard, plunger_ui.ProxyDashboard
+    )
+    dashboard._set_busy = lambda message: None
+    dashboard._poll_pending_action = lambda: None
+    dashboard._t = lambda key, **kwargs: key
+
+    monkeypatch.setattr(plunger_ui, "_is_frozen_app", lambda: True)
+    monkeypatch.setattr(plunger_ui, "EmbeddedProxyProcess", FakeEmbeddedProcess)
+    monkeypatch.setattr(
+        plunger_ui.subprocess,
+        "Popen",
+        lambda *args, **kwargs: (_ for _ in ()).throw(AssertionError("Popen should not be used")),
+    )
+
+    dashboard._start_proxy()
+
+    assert len(created) == 1
+    assert dashboard.process is created[0]
+    assert created[0].started is True
+    assert created[0].base_url == "http://127.0.0.1:8462"
+    assert created[0].cli_args == [
+        "--port",
+        "8462",
+        "--timeout",
+        "60.0",
+        "--retries",
+        "-1",
+        "--watch-interval",
+        "1.0",
+    ]

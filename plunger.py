@@ -26,6 +26,7 @@ import socket
 import subprocess
 import sys
 import tempfile
+import threading
 import time
 from contextlib import suppress
 from copy import deepcopy
@@ -96,6 +97,7 @@ DEFAULT_VISIBLE_OUTPUT_TIMEOUT = 60.0
 MIN_HEARTBEAT_INTERVAL = 1.5
 MAX_HEARTBEAT_INTERVAL = 3.0
 SSE_HEARTBEAT_FRAME = b": keep-alive\n\n"
+ANTHROPIC_PING_FRAME = b'event: ping\ndata: {"type":"ping"}\n\n'
 WATCHDOG_POLL_INTERVAL = 1.0
 WATCHDOG_STARTUP_GRACE = 20.0
 WATCHDOG_FAILURE_GRACE = 12.0
@@ -2101,9 +2103,16 @@ class StreamState:
 
 
 class SSEStreamWriter:
-    def __init__(self, response: web.StreamResponse, heartbeat_interval: float):
+    def __init__(
+        self,
+        response: web.StreamResponse,
+        heartbeat_interval: float,
+        *,
+        heartbeat_frame: bytes = SSE_HEARTBEAT_FRAME,
+    ):
         self.response = response
         self.heartbeat_interval = heartbeat_interval
+        self.heartbeat_frame = heartbeat_frame or SSE_HEARTBEAT_FRAME
         self._lock = asyncio.Lock()
         self._last_write_at = time.monotonic()
         self._heartbeat_task: asyncio.Task[None] | None = None
@@ -2168,7 +2177,7 @@ class SSEStreamWriter:
             if time.monotonic() - self._last_write_at < self.heartbeat_interval:
                 continue
             try:
-                await self.write(SSE_HEARTBEAT_FRAME)
+                await self.write(self.heartbeat_frame)
             except Exception as exc:
                 if _is_client_disconnect_error(exc):
                     self._disconnect_error = exc
@@ -2252,6 +2261,14 @@ class ResilientProxy:
         # Codex clients tend to enforce their own request deadline, so responses
         # streams need to recover no later than messages streams.
         return self.first_byte_timeout, self.stall_timeout, self.visible_output_timeout
+
+    def _make_client_stream(self, response: web.StreamResponse, endpoint: str) -> SSEStreamWriter:
+        heartbeat_frame = ANTHROPIC_PING_FRAME if endpoint == "/v1/messages" else SSE_HEARTBEAT_FRAME
+        return SSEStreamWriter(
+            response,
+            self.heartbeat_interval,
+            heartbeat_frame=heartbeat_frame,
+        )
 
     def _allow_proxy_body_growth(
         self,
@@ -3543,7 +3560,7 @@ class ResilientProxy:
             }
         )
         await response.prepare(req)
-        client_stream = SSEStreamWriter(response, self.heartbeat_interval)
+        client_stream = self._make_client_stream(response, "/v1/messages")
         client_stream.start()
         try:
             attempt = 0
@@ -3700,7 +3717,7 @@ class ResilientProxy:
             }
         )
         await response.prepare(req)
-        client_stream = SSEStreamWriter(response, self.heartbeat_interval)
+        client_stream = self._make_client_stream(response, "/v1/responses")
         client_stream.start()
         try:
             attempt = 0
@@ -3847,7 +3864,7 @@ class ResilientProxy:
             }
         )
         await response.prepare(req)
-        client_stream = SSEStreamWriter(response, self.heartbeat_interval)
+        client_stream = self._make_client_stream(response, "/v1/chat/completions")
         client_stream.start()
         try:
             attempt = 0
@@ -4783,11 +4800,12 @@ async def run_proxy(args: argparse.Namespace) -> int:
         loop.call_soon_threadsafe(stop_event.set)
 
     previous_handlers: list[tuple[int, Any]] = []
-    for signal_name in ("SIGINT", "SIGTERM"):
-        if hasattr(signal, signal_name):
-            sig = getattr(signal, signal_name)
-            previous_handlers.append((sig, signal.getsignal(sig)))
-            signal.signal(sig, handle_signal)
+    if threading.current_thread() is threading.main_thread():
+        for signal_name in ("SIGINT", "SIGTERM"):
+            if hasattr(signal, signal_name):
+                sig = getattr(signal, signal_name)
+                previous_handlers.append((sig, signal.getsignal(sig)))
+                signal.signal(sig, handle_signal)
 
     proxy = ResilientProxy(
         settings_manager,
