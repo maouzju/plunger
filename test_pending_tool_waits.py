@@ -1,3 +1,5 @@
+import asyncio
+
 import plunger as rp
 
 
@@ -11,6 +13,52 @@ class MockSettingsManager:
 
 def _make_proxy() -> rp.ResilientProxy:
     return rp.ResilientProxy(MockSettingsManager(), stall_timeout=60.0, max_retries=0)
+
+
+def test_responses_tail_fetch_timeout_uses_bounded_window() -> None:
+    proxy = rp.ResilientProxy(MockSettingsManager(), stall_timeout=60.0, max_retries=0)
+    assert proxy._responses_tail_fetch_timeout() == 30.0
+
+    fast_proxy = rp.ResilientProxy(MockSettingsManager(), stall_timeout=5.0, max_retries=0)
+    assert fast_proxy._responses_tail_fetch_timeout() == 12.0
+
+
+def test_handle_shutdown_takeover_marks_cleanup_to_skip_restore() -> None:
+    proxy = _make_proxy()
+    recorded_events: list[tuple[tuple[object, ...], dict[str, object]]] = []
+    proxy.event_history = type(
+        "EventHistoryStub",
+        (),
+        {"add": lambda self, *args, **kwargs: recorded_events.append((args, kwargs))},
+    )()
+
+    class DummyRequest:
+        query = {"mode": "takeover"}
+        app = {
+            "stop_event": asyncio.Event(),
+            "cleanup_state": {"skip_restore": False, "reason": "manual"},
+        }
+
+    async def run_case() -> None:
+        response = await proxy.handle_shutdown(DummyRequest())
+        assert response.status == 200
+        assert DummyRequest.app["cleanup_state"] == {
+            "skip_restore": True,
+            "reason": "takeover",
+        }
+        await asyncio.sleep(0.25)
+        assert DummyRequest.app["stop_event"].is_set()
+
+    asyncio.run(run_case())
+
+    assert recorded_events
+    args, kwargs = recorded_events[0]
+    assert args[:3] == (
+        "service_takeover",
+        "Proxy handoff",
+        "Another Plunger instance is taking over this port; restore is skipped.",
+    )
+    assert kwargs["meta"] == {"reason": "takeover", "skip_restore": True}
 
 
 def test_register_pending_tool_wait_keeps_response_id_for_responses() -> None:

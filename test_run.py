@@ -34,6 +34,30 @@ def test_scan_managed_process_pids_matches_only_other_related_processes(monkeypa
     assert run._scan_managed_process_pids(current_pid=100) == {101}
 
 
+def test_request_shutdown_for_port_uses_takeover_mode(monkeypatch) -> None:
+    calls: list[tuple[int, str, str, float]] = []
+
+    def fake_request_local_json(
+        port: int,
+        path: str,
+        *,
+        method: str = "GET",
+        timeout: float = 1.2,
+    ) -> dict[str, object]:
+        calls.append((port, path, method, timeout))
+        if path == "/health":
+            return {"safety_watchdog_pid": 4321}
+        return {"status": "stopping"}
+
+    monkeypatch.setattr(run, "_request_local_json", fake_request_local_json)
+
+    assert run._request_shutdown_for_port(8462) == 4321
+    assert calls == [
+        (8462, "/health", "GET", 0.8),
+        (8462, "/control/shutdown?mode=takeover", "POST", 1.2),
+    ]
+
+
 def test_prelaunch_cleanup_shuts_down_then_kills_without_restoring_settings(monkeypatch) -> None:
     events: list[tuple[str, object]] = []
 

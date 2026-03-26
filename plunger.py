@@ -94,6 +94,8 @@ RECOVERY_RETRY_DELAY_MAX = 30.0
 RECOVERY_RETRY_BACKOFF_FACTOR = 1.5
 MIN_FIRST_BYTE_TIMEOUT = 90.0
 DEFAULT_VISIBLE_OUTPUT_TIMEOUT = 60.0
+MIN_RESPONSES_TAIL_FETCH_TIMEOUT = 12.0
+MAX_RESPONSES_TAIL_FETCH_TIMEOUT = 30.0
 MIN_HEARTBEAT_INTERVAL = 1.5
 MAX_HEARTBEAT_INTERVAL = 3.0
 SSE_HEARTBEAT_FRAME = b": keep-alive\n\n"
@@ -269,6 +271,10 @@ def _extract_auth_token(settings: dict[str, Any]) -> str:
 
 def _is_cc_switch_proxy_url(base_url: str) -> bool:
     return str(base_url or "").strip().rstrip("/") == CC_SWITCH_PROXY_URL
+
+
+def _shutdown_skips_restore(mode: str) -> bool:
+    return str(mode or "").strip().lower() in {"takeover", "restart"}
 
 
 def _with_base_url(settings: dict[str, Any], base_url: str) -> dict[str, Any]:
@@ -674,7 +680,12 @@ def _take_over_existing_proxy_instance(listen_port: int) -> None:
     )
 
     with suppress(Exception):
-        _request_local_json(listen_port, "/control/shutdown", method="POST", timeout=1.2)
+        _request_local_json(
+            listen_port,
+            "/control/shutdown?mode=takeover",
+            method="POST",
+            timeout=1.2,
+        )
 
     if _wait_for_local_port_release(listen_port, timeout=8.0):
         log.info("Previous proxy on %s stopped cleanly", proxy_url)
@@ -1652,6 +1663,11 @@ class CodexConfigManager:
             with suppress(FileNotFoundError):
                 CODEX_STATE_FILE.unlink()
 
+    def discard_state(self) -> None:
+        self._restored = True
+        with suppress(FileNotFoundError):
+            CODEX_STATE_FILE.unlink()
+
     def _extract_provider_name(self, text: str) -> str:
         match = re.search(r'(?m)^\s*model_provider\s*=\s*"([^"]+)"\s*$', text)
         return match.group(1).strip() if match else ""
@@ -1943,6 +1959,10 @@ class SettingsManager:
         finally:
             if should_clear_state:
                 self._clear_state()
+
+    def discard_state(self) -> None:
+        self._restored = True
+        self._clear_state()
 
     def _recover_stale_upstream(self, settings: dict[str, Any]) -> tuple[str, str]:
         if self.upstream_override:
@@ -2261,6 +2281,15 @@ class ResilientProxy:
         # Codex clients tend to enforce their own request deadline, so responses
         # streams need to recover no later than messages streams.
         return self.first_byte_timeout, self.stall_timeout, self.visible_output_timeout
+
+    def _responses_tail_fetch_timeout(self) -> float:
+        # Some relays close the SSE before the response object becomes fetchable.
+        # Give tail fetch enough time to catch up, but keep it bounded so recovery
+        # still falls back to stream retry in a reasonable time.
+        return min(
+            max(self.stall_timeout, MIN_RESPONSES_TAIL_FETCH_TIMEOUT),
+            MAX_RESPONSES_TAIL_FETCH_TIMEOUT,
+        )
 
     def _make_client_stream(self, response: web.StreamResponse, endpoint: str) -> SSEStreamWriter:
         heartbeat_frame = ANTHROPIC_PING_FRAME if endpoint == "/v1/messages" else SSE_HEARTBEAT_FRAME
@@ -2628,16 +2657,29 @@ class ResilientProxy:
         return web.json_response(self._build_health_payload())
 
     async def handle_shutdown(self, request: web.Request) -> web.Response:
+        shutdown_mode = str(request.query.get("mode", "manual")).strip().lower() or "manual"
+        skip_restore = _shutdown_skips_restore(shutdown_mode)
+        cleanup_state = request.app.get("cleanup_state")
+        if skip_restore and isinstance(cleanup_state, dict):
+            cleanup_state["skip_restore"] = True
+            cleanup_state["reason"] = shutdown_mode
+
         self.event_history.add(
-            "service_stop",
-            "Proxy stopping",
-            "Manual shutdown requested from the desktop control panel.",
+            "service_takeover" if skip_restore else "service_stop",
+            "Proxy handoff" if skip_restore else "Proxy stopping",
+            (
+                "Another Plunger instance is taking over this port; restore is skipped."
+                if skip_restore
+                else "Manual shutdown requested from the desktop control panel."
+            ),
             tone="neutral",
-            meta={"reason": "manual_ui"},
+            meta={"reason": shutdown_mode, "skip_restore": skip_restore},
         )
         stop_event = request.app["stop_event"]
         asyncio.get_running_loop().call_later(0.2, stop_event.set)
-        return web.json_response({"status": "stopping"})
+        return web.json_response(
+            {"status": "stopping", "mode": shutdown_mode, "skip_restore": skip_restore}
+        )
 
 
     def _summarize_saved_session(self, snapshot: dict[str, Any] | None) -> dict[str, Any] | None:
@@ -4486,39 +4528,55 @@ class ResilientProxy:
             if key.lower() not in {"content-type", "accept"}
         }
 
-        deadline = time.monotonic() + min(max(self.stall_timeout, 3.0), 12.0)
+        tail_timeout = self._responses_tail_fetch_timeout()
+        deadline = time.monotonic() + tail_timeout
         url = f"{upstream}/v1/responses/{state.response_id}"
+        last_status = "pending"
 
         async with aiohttp.ClientSession() as session:
             while time.monotonic() < deadline:
                 try:
                     async with session.request("GET", url, headers=request_headers) as response:
                         if response.status == 404:
+                            log.info("tail fetch unavailable for %s: upstream returned 404", state.response_id)
                             return False
                         if response.status >= 500:
+                            last_status = f"http_{response.status}"
                             await asyncio.sleep(1)
                             continue
                         if response.status >= 400:
+                            log.info("tail fetch unavailable for %s: upstream returned %s", state.response_id, response.status)
                             return False
 
                         payload = await response.json()
                 except aiohttp.ClientError:
+                    last_status = "client_error"
                     await asyncio.sleep(1)
                     continue
                 except Exception as exc:
+                    last_status = f"error:{type(exc).__name__}"
                     log.warning("tail recovery error for %s: %s", state.response_id, exc)
                     await asyncio.sleep(1)
                     continue
 
                 status = str(payload.get("status", "")).lower()
+                if status:
+                    last_status = status
                 if status == "completed":
                     await self._forward_recovered_response(payload, state, client_stream)
                     return True
                 if status in {"failed", "incomplete", "cancelled", "canceled"}:
+                    log.info("tail fetch stopped for %s: upstream status=%s", state.response_id, status)
                     return False
 
                 await asyncio.sleep(1)
 
+        log.info(
+            "tail fetch timed out for %s after %.1fs (last_status=%s)",
+            state.response_id,
+            tail_timeout,
+            last_status,
+        )
         return False
 
     async def _forward_recovered_response(
@@ -4780,14 +4838,23 @@ async def run_proxy(args: argparse.Namespace) -> int:
         sys.exit(1)
 
     restored = [False]
+    cleanup_state = {"skip_restore": False, "reason": "manual"}
     watchdog_pid_holder: list[int | None] = [None]
 
     def cleanup() -> None:
         if restored[0]:
             return
         restored[0] = True
-        codex_config_manager.restore()
-        settings_manager.restore()
+        if cleanup_state["skip_restore"]:
+            log.info(
+                "Skipping config restore during shutdown (%s); another proxy instance is taking over",
+                cleanup_state["reason"],
+            )
+            codex_config_manager.discard_state()
+            settings_manager.discard_state()
+        else:
+            codex_config_manager.restore()
+            settings_manager.restore()
         wd = watchdog_pid_holder[0]
         if wd:
             _terminate_pid_best_effort(wd)
@@ -4822,6 +4889,7 @@ async def run_proxy(args: argparse.Namespace) -> int:
         middlewares=[proxy_error_middleware],
     )
     app["stop_event"] = stop_event
+    app["cleanup_state"] = cleanup_state
     app.router.add_post("/v1/messages", proxy.handle_messages)
     app.router.add_post("/v1/responses", proxy.handle_responses)
     app.router.add_post("/v1/chat/completions", proxy.handle_chat_completions)

@@ -81,7 +81,7 @@ def _request_shutdown_for_port(port: int) -> int:
         health = _request_local_json(port, "/health", timeout=0.8) or {}
         watchdog_pid = _extract_positive_int(health.get("safety_watchdog_pid"))
     with suppress(Exception):
-        _request_local_json(port, "/control/shutdown", method="POST", timeout=1.2)
+        _request_local_json(port, "/control/shutdown?mode=takeover", method="POST", timeout=1.2)
     return watchdog_pid
 
 
