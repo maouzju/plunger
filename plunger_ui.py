@@ -5,15 +5,18 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import importlib.metadata
 import json
 import logging
 import os
 import re
+import shutil
 import subprocess
 import sys
 import threading
 import time
 import tkinter as tk
+import webbrowser
 from contextlib import suppress
 from datetime import datetime
 from pathlib import Path
@@ -22,7 +25,16 @@ from typing import Any
 from urllib.error import HTTPError, URLError
 from urllib.request import ProxyHandler, Request, build_opener
 
-from plunger_shared import DEFAULT_PORT, DEFAULT_STALL_TIMEOUT, RECOVERY_DIR
+from plunger_shared import (
+    APP_VERSION,
+    DEFAULT_PORT,
+    DEFAULT_STALL_TIMEOUT,
+    GITHUB_RELEASES_API_URL,
+    GITHUB_RELEASES_PAGE_URL,
+    PACKAGE_NAME,
+    PREFERRED_WINDOWS_RELEASE_ASSETS,
+    RECOVERY_DIR,
+)
 
 POLL_INTERVAL_MS = 1600
 WINDOW_BG = "#faf6f1"
@@ -52,6 +64,8 @@ _FONT_TITLE = "Microsoft YaHei UI"
 UI_SETTINGS_FILE = RECOVERY_DIR / "ui_settings.json"
 GUI_STATE_FILE = RECOVERY_DIR / "gui_state.json"
 UI_LOG_FILE = RECOVERY_DIR / "ui.log"
+EVENT_HISTORY_FILE = RECOVERY_DIR / "events.json"
+SUPERVISOR_STATE_FILE = RECOVERY_DIR / "supervisor_state.json"
 STARTUP_DIR = Path(os.getenv("APPDATA", str(Path.home() / "AppData" / "Roaming"))) / "Microsoft" / "Windows" / "Start Menu" / "Programs" / "Startup"
 STARTUP_LAUNCHER_FILE = STARTUP_DIR / "Plunger Launcher.vbs"
 
@@ -74,6 +88,7 @@ logging.basicConfig(
 )
 log = logging.getLogger("resilient-proxy-ui")
 LOCAL_OPENER = build_opener(ProxyHandler({}))
+_PYPROJECT_VERSION_RE = re.compile(r'(?m)^version\s*=\s*"([^"]+)"\s*$')
 
 
 def _is_frozen_app() -> bool:
@@ -82,6 +97,44 @@ def _is_frozen_app() -> bool:
 
 def _app_executable_path() -> Path:
     return Path(sys.executable).resolve()
+
+
+def _read_json_file(path: Path) -> dict[str, Any] | None:
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except Exception:
+        return None
+    return payload if isinstance(payload, dict) else None
+
+
+def _extract_positive_int(value: Any) -> int:
+    try:
+        number = int(value)
+    except (TypeError, ValueError):
+        return 0
+    return number if number > 0 else 0
+
+
+def _read_supervisor_pid() -> int:
+    payload = _read_json_file(SUPERVISOR_STATE_FILE)
+    return _extract_positive_int((payload or {}).get("pid"))
+
+
+def _terminate_pid_tree(pid: int) -> None:
+    if pid <= 0:
+        return
+
+    if os.name == "nt":
+        subprocess.run(
+            ["taskkill", "/PID", str(pid), "/T", "/F"],
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        return
+
+    with suppress(ProcessLookupError, PermissionError):
+        os.kill(pid, 15)
 
 
 def _write_gui_state(pid: int | None = None) -> None:
@@ -148,6 +201,161 @@ def _app_base_dir() -> Path:
     return Path(__file__).resolve().parent
 
 
+def _detect_app_version() -> str:
+    try:
+        version = importlib.metadata.version(PACKAGE_NAME).strip()
+    except importlib.metadata.PackageNotFoundError:
+        version = ""
+    if version:
+        return version
+
+    pyproject_path = Path(__file__).resolve().with_name("pyproject.toml")
+    try:
+        match = _PYPROJECT_VERSION_RE.search(pyproject_path.read_text(encoding="utf-8"))
+    except OSError:
+        match = None
+    if match:
+        parsed = match.group(1).strip()
+        if parsed:
+            return parsed
+    return APP_VERSION
+
+
+def _normalize_release_version(value: str) -> str:
+    return value.strip().lstrip("vV")
+
+
+def _version_sort_key(value: str) -> tuple[tuple[int, ...], int]:
+    cleaned = _normalize_release_version(value).lower()
+    if not cleaned:
+        return (0,), 1
+
+    prerelease = 0 if re.search(r"(?:-|(?:a|alpha|b|beta|rc)\d*)", cleaned) else 1
+    core = re.split(r"[-+]", cleaned, maxsplit=1)[0]
+    numbers = tuple(int(part) for part in re.findall(r"\d+", core))
+    if not numbers:
+        return (0,), prerelease
+    return numbers, prerelease
+
+
+def _is_newer_version(candidate: str, current: str) -> bool:
+    candidate_numbers, candidate_stability = _version_sort_key(candidate)
+    current_numbers, current_stability = _version_sort_key(current)
+    width = max(len(candidate_numbers), len(current_numbers))
+    candidate_numbers = candidate_numbers + (0,) * (width - len(candidate_numbers))
+    current_numbers = current_numbers + (0,) * (width - len(current_numbers))
+    if candidate_numbers != current_numbers:
+        return candidate_numbers > current_numbers
+    return candidate_stability > current_stability
+
+
+def _github_request_json(url: str, *, timeout: float = 8.0) -> dict[str, Any]:
+    request = Request(url)
+    request.add_header("Accept", "application/vnd.github+json")
+    request.add_header("User-Agent", f"Plunger/{_detect_app_version()}")
+    with build_opener().open(request, timeout=timeout) as response:
+        charset = response.headers.get_content_charset() or "utf-8"
+        payload = response.read().decode(charset)
+    data = json.loads(payload)
+    if not isinstance(data, dict):
+        raise ValueError("Unexpected release payload")
+    return data
+
+
+def _pick_release_asset(release: dict[str, Any]) -> dict[str, str] | None:
+    assets = release.get("assets")
+    if not isinstance(assets, list):
+        return None
+
+    normalized_assets: list[dict[str, str]] = []
+    for asset in assets:
+        if not isinstance(asset, dict):
+            continue
+        name = str(asset.get("name", "")).strip()
+        url = str(asset.get("browser_download_url", "")).strip()
+        if not name or not url:
+            continue
+        normalized_assets.append({"name": name, "url": url})
+
+    if not normalized_assets:
+        return None
+
+    if os.name == "nt":
+        for preferred_name in PREFERRED_WINDOWS_RELEASE_ASSETS:
+            for asset in normalized_assets:
+                if asset["name"].lower() == preferred_name.lower():
+                    return asset
+        for asset in normalized_assets:
+            name = asset["name"].lower()
+            if "plunger" in name and (name.endswith(".zip") or name.endswith(".exe")):
+                return asset
+
+    return normalized_assets[0]
+
+
+def _fetch_latest_release_info(current_version: str) -> dict[str, Any]:
+    release = _github_request_json(GITHUB_RELEASES_API_URL)
+    tag_name = str(release.get("tag_name") or release.get("name") or "").strip()
+    latest_version = _normalize_release_version(tag_name)
+    if not latest_version:
+        raise ValueError("Latest release tag is missing")
+
+    asset = _pick_release_asset(release) or {}
+    return {
+        "current_version": current_version,
+        "latest_version": latest_version,
+        "is_newer": _is_newer_version(latest_version, current_version),
+        "asset_name": str(asset.get("name", "")).strip(),
+        "asset_url": str(asset.get("url", "")).strip(),
+        "html_url": str(release.get("html_url") or GITHUB_RELEASES_PAGE_URL).strip() or GITHUB_RELEASES_PAGE_URL,
+    }
+
+
+def _default_update_download_dir() -> Path:
+    downloads = Path.home() / "Downloads" / "Plunger"
+    if downloads.parent.exists():
+        return downloads
+    return Path.home() / "Plunger"
+
+
+def _download_release_asset(download_url: str, asset_name: str, *, timeout: float = 30.0) -> Path:
+    target_dir = _default_update_download_dir()
+    target_dir.mkdir(parents=True, exist_ok=True)
+    safe_name = Path(asset_name).name or "Plunger-update.zip"
+    target_path = target_dir / safe_name
+
+    request = Request(download_url)
+    request.add_header("Accept", "application/octet-stream")
+    request.add_header("User-Agent", f"Plunger/{_detect_app_version()}")
+    with build_opener().open(request, timeout=timeout) as response:
+        with target_path.open("wb") as handle:
+            shutil.copyfileobj(response, handle)
+    return target_path
+
+
+def _open_path_in_shell(path: Path) -> None:
+    resolved = path.resolve()
+    if os.name == "nt":
+        if resolved.exists() and resolved.is_file():
+            subprocess.Popen(["explorer", "/select,", str(resolved)])
+            return
+        os.startfile(str(resolved))  # type: ignore[attr-defined]
+        return
+
+    target = resolved if resolved.exists() else resolved.parent
+    webbrowser.open(target.as_uri())
+
+
+def _format_request_error(exc: Exception) -> str:
+    if isinstance(exc, HTTPError):
+        return f"HTTP {exc.code}"
+    if isinstance(exc, URLError):
+        reason = str(getattr(exc, "reason", "")).strip()
+        return reason or exc.__class__.__name__
+    message = str(exc).strip()
+    return message or exc.__class__.__name__
+
+
 LANGUAGES = {
     "zh_CN": "\u7b80\u4f53\u4e2d\u6587",
     "en_US": "English",
@@ -162,6 +370,23 @@ TRANSLATIONS: dict[str, dict[str, str]] = {
         "language_label": "\u8bed\u8a00",
         "launch_on_boot_label": "\u5f00\u673a\u542f\u52a8",
         "auto_start_proxy_label": "\u542f\u52a8\u540e\u81ea\u52a8\u5f00\u542f\u4ee3\u7406",
+        "update_title": "\u7248\u672c\u66f4\u65b0",
+        "current_version_label": "\u5f53\u524d\u7248\u672c\uff1a{version}",
+        "update_status_idle": "\u70b9\u51fb\u6309\u94ae\u540e\u68c0\u67e5 GitHub \u4e0a\u662f\u5426\u6709\u65b0\u7248\u672c\u3002",
+        "update_status_checking": "\u6b63\u5728\u68c0\u67e5 GitHub Release...",
+        "update_status_latest": "\u5f53\u524d\u5df2\u662f\u6700\u65b0\u7248\u672c {version}\u3002",
+        "update_status_available_download": "\u53d1\u73b0\u65b0\u7248\u672c {version}\uff0c\u53ef\u4ee5\u76f4\u63a5\u4e0b\u8f7d\u66f4\u65b0\u5305\u3002",
+        "update_status_available_release": "\u53d1\u73b0\u65b0\u7248\u672c {version}\uff0c\u53ef\u6253\u5f00 GitHub \u53d1\u5e03\u9875\u66f4\u65b0\u3002",
+        "update_status_downloading": "\u6b63\u5728\u4e0b\u8f7d {name}...",
+        "update_status_downloaded": "\u5df2\u4e0b\u8f7d\u5230 {path}\u3002",
+        "update_status_failed": "\u68c0\u67e5\u66f4\u65b0\u5931\u8d25\uff1a{reason}",
+        "update_status_download_failed": "\u4e0b\u8f7d\u66f4\u65b0\u5931\u8d25\uff1a{reason}",
+        "update_button_check": "\u68c0\u67e5\u66f4\u65b0",
+        "update_button_checking": "\u68c0\u67e5\u4e2d...",
+        "update_button_download": "\u4e0b\u8f7d\u66f4\u65b0",
+        "update_button_downloading": "\u4e0b\u8f7d\u4e2d...",
+        "update_button_open_download": "\u6253\u5f00\u4e0b\u8f7d\u76ee\u5f55",
+        "update_button_open_release": "\u6253\u5f00\u53d1\u5e03\u9875",
         "action_on": "\u5f00\u542f\u4ee3\u7406",
         "action_off": "\u5173\u95ed\u4ee3\u7406",
         "status_online": "\u8fd0\u884c\u4e2d",
@@ -182,17 +407,27 @@ TRANSLATIONS: dict[str, dict[str, str]] = {
         "source_codex_config": "Codex \u914d\u7f6e",
         "source_cc_switch": "CC Switch",
         "stats_requests": "\u603b\u8bf7\u6c42",
-        "stats_success": "\u6062\u590d\u6210\u529f",
+        "stats_success": "\u758f\u901a\u6210\u529f",
         "stats_triggers": "\u65ad\u8fde\u89e6\u53d1",
+        "stats_today_success": "\u4eca\u65e5\u758f\u901a\u6b21\u6570",
+        "stats_history_success": "\u5386\u53f2\u758f\u901a\u6b21\u6570",
         "active_title": "\u5f53\u524d\u6d3b\u8dc3\u4f1a\u8bdd",
         "active_none": "\u5f53\u524d\u6ca1\u6709\u6b63\u5728\u6d41\u5f0f\u4f20\u8f93\u6216\u7b49\u5f85\u5de5\u5177\u7ed3\u679c\u7684\u4f1a\u8bdd\u3002",
         "active_running": "{endpoint} \u6b63\u5728\u5904\u7406\u4e2d\uff0c\u6700\u8fd1\u66f4\u65b0\uff1a{updated_at}\u3002",
+        "active_recovering": "{endpoint} \u6b63\u5728\u65ad\u8fde\u6062\u590d\u4e2d\uff0c\u7b2c {attempt} \u6b21\u91cd\u8bd5\uff0c\u6700\u8fd1\u66f4\u65b0\uff1a{updated_at}\u3002",
         "active_waiting_tool": "{endpoint} \u5df2\u53d1\u51fa\u5de5\u5177\u8c03\u7528\uff0c\u6b63\u5728\u7b49\u5f85\u672c\u5730\u5de5\u5177\u7ed3\u679c\u3002\u6700\u8fd1\u66f4\u65b0\uff1a{updated_at}\u3002",
         "active_tool_timeout": "{endpoint} \u53d1\u51fa\u5de5\u5177\u8c03\u7528\u540e\u5df2\u7b49\u5f85 {seconds} \u79d2\uff0c\u4e0b\u4e00\u8f6e\u8bf7\u6c42\u8fd8\u6ca1\u56de\u6765\u3002\u6700\u8fd1\u66f4\u65b0\uff1a{updated_at}\u3002",
         "active_count_label": "\u5171 {count} \u6761\u6d3b\u8dc3\u4f1a\u8bdd",
         "active_summary_label": "\u6807\u9898\uff1a{summary}",
         "active_model_label": "\u6a21\u578b\uff1a{model}",
         "active_client_label": "\u8fde\u63a5\uff1a{client}",
+        "active_hint_label": "\u63d0\u793a\uff1a{hint}",
+        "active_hint_station_issue": "\u5df2\u91cd\u8bd5\u591a\u6b21\u4ecd\u672a\u8fde\u4e0a\uff0c\u8f83\u53ef\u80fd\u662f\u4e2d\u8f6c\u7ad9\u6216\u4e0a\u6e38\u901a\u9053\u6682\u65f6\u4e0d\u53ef\u7528\uff0c\u4e0d\u662f\u4f60\u5f53\u524d\u64cd\u4f5c\u5361\u4f4f\u4e86\u3002",
+        "active_reason_station_no_channel": "\u4e2d\u8f6c\u7ad9\u5f53\u524d\u6ca1\u6709\u53ef\u7528\u901a\u9053\uff0c\u6b63\u5728\u81ea\u52a8\u91cd\u8bd5\u3002",
+        "active_reason_station_503": "\u4e2d\u8f6c\u7ad9\u6682\u65f6\u4e0d\u53ef\u7528\uff0c\u6b63\u5728\u81ea\u52a8\u91cd\u8bd5\u3002",
+        "active_reason_station_502": "\u4e2d\u8f6c\u7ad9\u4e0e\u4e0a\u6e38\u8fde\u63a5\u5f02\u5e38\uff0c\u6b63\u5728\u81ea\u52a8\u91cd\u8bd5\u3002",
+        "active_reason_station_timeout": "\u4e2d\u8f6c\u7ad9\u8fde\u63a5\u8d85\u65f6\uff0c\u6b63\u5728\u81ea\u52a8\u91cd\u8bd5\u3002",
+        "active_reason_label": "\u6700\u8fd1\u5f02\u5e38\uff1a{reason}",
         "active_last_user_label": "\u6700\u8fd1\u8f93\u5165\uff1a{preview}",
         "active_partial_label": "\u6700\u8fd1\u8f93\u51fa\uff1a{preview}",
         "active_partial_chars_label": "\u5df2\u89c1\u6587\u672c\uff1a{chars} \u5b57\u7b26",
@@ -205,6 +440,7 @@ TRANSLATIONS: dict[str, dict[str, str]] = {
         "active_col_client": "\u8fde\u63a5",
         "active_col_input": "\u6700\u8fd1\u8f93\u5165",
         "active_status_running": "\u5904\u7406\u4e2d",
+        "active_status_recovering": "\u91cd\u8bd5\u4e2d",
         "active_status_waiting_tool": "\u7b49\u5f85\u5de5\u5177",
         "active_status_tool_timeout": "\u5de5\u5177\u8d85\u65f6",
         "events_title": "\u6700\u8fd1\u758f\u901a",
@@ -227,7 +463,15 @@ TRANSLATIONS: dict[str, dict[str, str]] = {
         "footer_auto_start_proxy_enabled": "\u5df2\u5f00\u542f\u201c\u542f\u52a8\u540e\u81ea\u52a8\u5f00\u542f\u4ee3\u7406\u201d\u3002",
         "footer_auto_start_proxy_disabled": "\u5df2\u5173\u95ed\u201c\u542f\u52a8\u540e\u81ea\u52a8\u5f00\u542f\u4ee3\u7406\u201d\u3002",
         "footer_startup_setting_failed": "\u542f\u52a8\u9879\u8bbe\u7f6e\u5931\u8d25\uff0c\u8bf7\u68c0\u67e5\u6587\u4ef6\u6743\u9650\u3002",
-        "trigger_hint": "\"\u65ad\u8fde\u89e6\u53d1\"\u53ea\u5728\u67d0\u4e2a\u8bf7\u6c42\u7b2c\u4e00\u6b21\u8fdb\u5165\u6062\u590d\u673a\u5236\u65f6\u8bb0 1 \u6b21\u3002\"\u6062\u590d\u6210\u529f\"\u8868\u793a\u8fd9\u6b21\u65ad\u8fde\u540e\u6700\u7ec8\u88ab\u6551\u56de\u3002\u771f\u6b63\u7684\u5f02\u5e38\u4e0d\u505a\u7edf\u8ba1\uff0c\u53ea\u4f1a\u8bb0\u5f55\u5728\u4e0b\u65b9\u4e8b\u4ef6\u5217\u8868\u91cc\u3002",
+        "footer_update_checking": "\u6b63\u5728\u68c0\u67e5\u66f4\u65b0...",
+        "footer_update_latest": "\u5df2\u7ecf\u662f\u6700\u65b0\u7248\u672c\u3002",
+        "footer_update_available": "\u53d1\u73b0\u65b0\u7248\u672c {version}\u3002",
+        "footer_update_downloading": "\u6b63\u5728\u4e0b\u8f7d\u66f4\u65b0...",
+        "footer_update_downloaded": "\u66f4\u65b0\u5305\u5df2\u4e0b\u8f7d\u5230 {path}\u3002",
+        "footer_update_release_opened": "\u5df2\u6253\u5f00 GitHub \u53d1\u5e03\u9875\u3002",
+        "footer_update_failed": "\u68c0\u67e5\u66f4\u65b0\u5931\u8d25\uff1a{reason}",
+        "footer_update_download_failed": "\u4e0b\u8f7d\u66f4\u65b0\u5931\u8d25\uff1a{reason}",
+        "trigger_hint": "\"\u65ad\u8fde\u89e6\u53d1\"\u53ea\u5728\u67d0\u4e2a\u8bf7\u6c42\u7b2c\u4e00\u6b21\u8fdb\u5165\u6062\u590d\u673a\u5236\u65f6\u8bb0 1 \u6b21\u3002\"\u758f\u901a\u6210\u529f\"\u8868\u793a\u8fd9\u6b21\u65ad\u8fde\u540e\u6700\u7ec8\u88ab\u6551\u56de\u3002\u771f\u6b63\u7684\u5f02\u5e38\u4e0d\u505a\u7edf\u8ba1\uff0c\u53ea\u4f1a\u8bb0\u5f55\u5728\u4e0b\u65b9\u4e8b\u4ef6\u5217\u8868\u91cc\u3002",
         "event_none_state": "\u6682\u65e0\u6d3b\u52a8",
         "event_none_summary": "\u6700\u8fd1\u8fd8\u6ca1\u6709\u65ad\u8fde\u6216\u6062\u590d\u4e8b\u4ef6\u3002",
         "event_none_summary_current_run": "\u672c\u8f6e\u4ee3\u7406\u542f\u52a8\u540e\uff0c\u6682\u65f6\u8fd8\u6ca1\u6709\u65ad\u8fde\u6216\u6062\u590d\u4e8b\u4ef6\u3002",
@@ -263,7 +507,7 @@ TRANSLATIONS: dict[str, dict[str, str]] = {
         "tab_events": "\u758f\u901a\u65e5\u5fd7",
         "tab_settings": "\u8bbe\u7f6e",
         "home_activity_title": "\u5b9e\u65f6\u6982\u89c8",
-        "settings_subtitle": "\u5728\u8fd9\u91cc\u8c03\u6574\u754c\u9762\u8bed\u8a00\u548c\u542f\u52a8\u884c\u4e3a\u3002",
+        "settings_subtitle": "\u5728\u8fd9\u91cc\u8c03\u6574\u754c\u9762\u8bed\u8a00\u3001\u542f\u52a8\u884c\u4e3a\u548c\u7248\u672c\u66f4\u65b0\u3002",
     },
     "en_US": {
         "window_title": "Plunger",
@@ -273,6 +517,23 @@ TRANSLATIONS: dict[str, dict[str, str]] = {
         "language_label": "Language",
         "launch_on_boot_label": "Launch On Startup",
         "auto_start_proxy_label": "Auto Start Proxy After Launch",
+        "update_title": "Version Update",
+        "current_version_label": "Current version: {version}",
+        "update_status_idle": "Use the button below to check whether GitHub has a newer release.",
+        "update_status_checking": "Checking GitHub releases...",
+        "update_status_latest": "You're already on the latest version: {version}.",
+        "update_status_available_download": "Version {version} is available and can be downloaded now.",
+        "update_status_available_release": "Version {version} is available. Open the GitHub release page to update.",
+        "update_status_downloading": "Downloading {name}...",
+        "update_status_downloaded": "Downloaded to {path}.",
+        "update_status_failed": "Update check failed: {reason}",
+        "update_status_download_failed": "Update download failed: {reason}",
+        "update_button_check": "Check For Updates",
+        "update_button_checking": "Checking...",
+        "update_button_download": "Download Update",
+        "update_button_downloading": "Downloading...",
+        "update_button_open_download": "Open Download Folder",
+        "update_button_open_release": "Open Release Page",
         "action_on": "Turn On",
         "action_off": "Turn Off",
         "status_online": "Online",
@@ -293,17 +554,27 @@ TRANSLATIONS: dict[str, dict[str, str]] = {
         "source_codex_config": "Codex config",
         "source_cc_switch": "CC Switch",
         "stats_requests": "Requests",
-        "stats_success": "Recovery Success",
+        "stats_success": "Plunge Success",
         "stats_triggers": "Recovery Triggers",
+        "stats_today_success": "Plunges Today",
+        "stats_history_success": "Recorded Plunges",
         "active_title": "Active Session",
         "active_none": "There is no streaming session or pending tool-result handoff right now.",
         "active_running": "{endpoint} is still in progress. Last update: {updated_at}.",
+        "active_recovering": "{endpoint} is retrying after a disconnect (attempt {attempt}). Last update: {updated_at}.",
         "active_waiting_tool": "{endpoint} finished with tool calls and is waiting for local tool results. Last update: {updated_at}.",
         "active_tool_timeout": "{endpoint} has been waiting {seconds}s for the next request after tool calls. Last update: {updated_at}.",
         "active_count_label": "{count} active sessions",
         "active_summary_label": "Title: {summary}",
         "active_model_label": "Model: {model}",
         "active_client_label": "Connection: {client}",
+        "active_hint_label": "Hint: {hint}",
+        "active_hint_station_issue": "It has retried several times and still cannot connect. This is more likely a relay or upstream-channel issue, not your current action being stuck.",
+        "active_reason_station_no_channel": "The relay currently has no available channel and is retrying automatically.",
+        "active_reason_station_503": "The relay is temporarily unavailable and is retrying automatically.",
+        "active_reason_station_502": "The relay lost its upstream connection and is retrying automatically.",
+        "active_reason_station_timeout": "The relay timed out while connecting and is retrying automatically.",
+        "active_reason_label": "Latest error: {reason}",
         "active_last_user_label": "Latest input: {preview}",
         "active_partial_label": "Latest output: {preview}",
         "active_partial_chars_label": "Visible text: {chars} chars",
@@ -316,6 +587,7 @@ TRANSLATIONS: dict[str, dict[str, str]] = {
         "active_col_client": "Connection",
         "active_col_input": "Latest Input",
         "active_status_running": "Running",
+        "active_status_recovering": "Retrying",
         "active_status_waiting_tool": "Waiting Tool",
         "active_status_tool_timeout": "Tool Timeout",
         "events_title": "Recent Resilience Events",
@@ -338,7 +610,15 @@ TRANSLATIONS: dict[str, dict[str, str]] = {
         "footer_auto_start_proxy_enabled": "\"Auto start proxy after launch\" is enabled.",
         "footer_auto_start_proxy_disabled": "\"Auto start proxy after launch\" is disabled.",
         "footer_startup_setting_failed": "Failed to update the startup setting. Check file permissions and retry.",
-        "trigger_hint": "\"Recovery Triggers\" increases only when a request enters recovery mode for the first time. \"Recovery Success\" means that triggered recovery eventually rescued the request. Real anomalies are not counted as a stat and only appear in the event list below.",
+        "footer_update_checking": "Checking for updates...",
+        "footer_update_latest": "You're already on the latest version.",
+        "footer_update_available": "Version {version} is available.",
+        "footer_update_downloading": "Downloading the update...",
+        "footer_update_downloaded": "The update package was downloaded to {path}.",
+        "footer_update_release_opened": "The GitHub release page has been opened.",
+        "footer_update_failed": "Update check failed: {reason}",
+        "footer_update_download_failed": "Update download failed: {reason}",
+        "trigger_hint": "\"Recovery Triggers\" increases only when a request enters recovery mode for the first time. \"Plunge Success\" means that triggered recovery eventually rescued the request. Real anomalies are not counted as a stat and only appear in the event list below.",
         "event_none_state": "No activity",
         "event_none_summary": "No recent disconnect or recovery events yet.",
         "event_none_summary_current_run": "No disconnect or recovery events have occurred in the current run yet.",
@@ -374,7 +654,7 @@ TRANSLATIONS: dict[str, dict[str, str]] = {
         "tab_events": "Events",
         "tab_settings": "Settings",
         "home_activity_title": "Live Snapshot",
-        "settings_subtitle": "Adjust the interface language and launch behavior here.",
+        "settings_subtitle": "Adjust the interface language, launch behavior, and update flow here.",
     },
 }
 
@@ -812,9 +1092,24 @@ class ProxyDashboard:
         self.reconnect_only_var = tk.BooleanVar(value=False)
         self.launch_on_boot_var = tk.BooleanVar(value=self._is_launch_on_boot_enabled())
         self.auto_start_proxy_var = tk.BooleanVar(value=bool(settings.get("auto_start_proxy", False)))
-        self.stat_label_vars = {key: tk.StringVar() for key in ("requests", "success", "triggers")}
+        self.current_version = _detect_app_version()
+        self.current_version_var = tk.StringVar()
+        self.update_status_var = tk.StringVar()
+        self.update_button_var = tk.StringVar()
+        self.update_action_mode = "check"
+        self.update_button_enabled = True
+        self.update_status_key = "update_status_idle"
+        self.update_status_kwargs: dict[str, Any] = {}
+        self.latest_release_info: dict[str, Any] | None = None
+        self.downloaded_update_path: Path | None = None
+        self.update_task_active = False
+        self.stat_label_vars = {
+            key: tk.StringVar()
+            for key in ("requests", "success", "triggers", "today_success", "history_success")
+        }
         self.stat_value_vars = {
-            key: tk.StringVar(value="0") for key in ("requests", "success", "triggers")
+            key: tk.StringVar(value="0")
+            for key in ("requests", "success", "triggers", "today_success", "history_success")
         }
 
         self._configure_window()
@@ -836,10 +1131,21 @@ class ProxyDashboard:
             str(self.args.retries),
             "--watch-interval",
             str(self.args.watch_interval),
+            "--aggressive-autoevolve",
+            "--enable-supervisor",
         ]
         if self.args.upstream:
             cli_args.extend(["--upstream", self.args.upstream])
         return cli_args
+
+    def _build_proxy_command(self) -> list[str]:
+        if _is_frozen_app():
+            return [sys.executable, "--headless", *self._build_proxy_cli_args()]
+        return [
+            sys.executable,
+            str(Path(__file__).with_name("plunger.py")),
+            *self._build_proxy_cli_args(),
+        ]
 
     def _load_ui_settings(self) -> dict[str, Any]:
         if not UI_SETTINGS_FILE.exists():
@@ -869,8 +1175,35 @@ class ProxyDashboard:
         template = TRANSLATIONS.get(self.language, TRANSLATIONS["zh_CN"]).get(key, key)
         return template.format(**kwargs)
 
+    def _set_update_status(self, key: str, **kwargs: Any) -> None:
+        self.update_status_key = key
+        self.update_status_kwargs = dict(kwargs)
+        self.update_status_var.set(self._t(key, **kwargs))
+
+    def _set_update_button_state(self, key: str, *, mode: str, enabled: bool) -> None:
+        self.update_action_mode = mode
+        self.update_button_enabled = enabled
+        self.update_button_var.set(self._t(key))
+        if hasattr(self, "update_button"):
+            self.update_button.configure(state="normal" if enabled else "disabled")
+
+    def _apply_update_texts(self) -> None:
+        self.current_version_var.set(self._t("current_version_label", version=self.current_version))
+        self.update_status_var.set(self._t(self.update_status_key, **self.update_status_kwargs))
+        button_key = {
+            "check": "update_button_check",
+            "checking": "update_button_checking",
+            "download": "update_button_download",
+            "downloading": "update_button_downloading",
+            "open_download": "update_button_open_download",
+            "open_release": "update_button_open_release",
+        }.get(self.update_action_mode, "update_button_check")
+        self.update_button_var.set(self._t(button_key))
+        if hasattr(self, "update_button"):
+            self.update_button.configure(state="normal" if self.update_button_enabled else "disabled")
+
     def _configure_window(self) -> None:
-        self.root.geometry("1220x920")
+        self.root.geometry("1220x1104")
         self.root.minsize(1020, 780)
         self.root.configure(bg=WINDOW_BG)
         self._set_window_icon()
@@ -1188,6 +1521,28 @@ class ProxyDashboard:
                 font=(_FONT_UI, 28, "bold"),
             ).pack(anchor="w", pady=(8, 0))
 
+        extra_stat_row = tk.Frame(home_page, bg=WINDOW_BG)
+        extra_stat_row.pack(fill="x", pady=(12, 0))
+        for index, key in enumerate(("today_success", "history_success")):
+            card = self._card(extra_stat_row, pady=18, padx=18)
+            card.pack(side="left", fill="both", expand=True)
+            if index == 0:
+                card.pack_configure(padx=(0, 12))
+            tk.Label(
+                card,
+                textvariable=self.stat_label_vars[key],
+                bg=CARD_BG,
+                fg=TEXT_SECONDARY,
+                font=(_FONT_UI, 10, "bold"),
+            ).pack(anchor="w")
+            tk.Label(
+                card,
+                textvariable=self.stat_value_vars[key],
+                bg=CARD_BG,
+                fg=ACCENT,
+                font=(_FONT_UI, 28, "bold"),
+            ).pack(anchor="w", pady=(8, 0))
+
         active_page = self._card(page_stack, pady=18, padx=20)
         self._tab_frames.append(active_page)
 
@@ -1224,6 +1579,7 @@ class ProxyDashboard:
         self.active_tree.grid(row=0, column=0, sticky="nsew")
 
         self.active_tree.tag_configure("running", foreground="#2eaa8a")
+        self.active_tree.tag_configure("recovering", foreground="#d09520")
         self.active_tree.tag_configure("waiting", foreground="#d09520")
         self.active_tree.tag_configure("timeout", foreground="#e85d4a")
 
@@ -1426,6 +1782,64 @@ class ProxyDashboard:
         )
         self.auto_start_proxy_check.pack(anchor="w", pady=(8, 0))
 
+        update_card = tk.Frame(
+            settings_card,
+            bg="#fffaf5",
+            highlightthickness=1,
+            highlightbackground=CARD_BORDER,
+            padx=18,
+            pady=16,
+        )
+        update_card.pack(fill="x", pady=(14, 0))
+
+        self.update_title_label = tk.Label(
+            update_card,
+            bg="#fffaf5",
+            fg=TEXT_SECONDARY,
+            font=(_FONT_UI, 10, "bold"),
+        )
+        self.update_title_label.pack(anchor="w")
+
+        self.current_version_label = tk.Label(
+            update_card,
+            textvariable=self.current_version_var,
+            bg="#fffaf5",
+            fg=TEXT_PRIMARY,
+            font=(_FONT_UI, 11, "bold"),
+        )
+        self.current_version_label.pack(anchor="w", pady=(8, 0))
+
+        update_row = tk.Frame(update_card, bg="#fffaf5")
+        update_row.pack(fill="x", pady=(10, 0))
+
+        self.update_status_label = tk.Label(
+            update_row,
+            textvariable=self.update_status_var,
+            bg="#fffaf5",
+            fg=TEXT_SECONDARY,
+            font=(_FONT_UI, 10),
+            justify="left",
+            wraplength=360,
+        )
+        self.update_status_label.pack(side="left", fill="x", expand=True)
+
+        self.update_button = tk.Button(
+            update_row,
+            textvariable=self.update_button_var,
+            command=self._on_update_button_clicked,
+            bg=ACCENT,
+            fg="#ffffff",
+            activebackground=ACCENT_HOVER,
+            activeforeground="#ffffff",
+            relief="flat",
+            bd=0,
+            padx=18,
+            pady=10,
+            cursor="hand2",
+            font=(_FONT_UI, 10, "bold"),
+        )
+        self.update_button.pack(side="right", padx=(14, 0))
+
         self._switch_tab(0)
 
     def _card(self, parent: tk.Misc, *, padx: int, pady: int) -> tk.Frame:
@@ -1478,6 +1892,7 @@ class ProxyDashboard:
         self.language_label.configure(text=self._t("language_label"))
         self.launch_on_boot_check.configure(text=self._t("launch_on_boot_label"))
         self.auto_start_proxy_check.configure(text=self._t("auto_start_proxy_label"))
+        self.update_title_label.configure(text=self._t("update_title"))
         self.events_title_label.configure(text=self._t("events_title"))
         self.events_subtitle_label.configure(text=self._t("events_subtitle"))
         self.events_scope_check.configure(text=self._t("events_scope_current_run"))
@@ -1499,8 +1914,12 @@ class ProxyDashboard:
         self.stat_label_vars["requests"].set(self._t("stats_requests"))
         self.stat_label_vars["success"].set(self._t("stats_success"))
         self.stat_label_vars["triggers"].set(self._t("stats_triggers"))
+        self.stat_label_vars["today_success"].set(self._t("stats_today_success"))
+        self.stat_label_vars["history_success"].set(self._t("stats_history_success"))
         self.retry_hint_var.set(self._t("trigger_hint"))
         self.language_combo.set(LANGUAGES[self.language])
+        self.current_version_var.set(self._t("current_version_label", version=self.current_version))
+        self._apply_update_texts()
         self._apply_health(self.latest_health)
 
     def _on_language_selected(self, _event: tk.Event[Any]) -> None:
@@ -1539,6 +1958,161 @@ class ProxyDashboard:
             )
         )
 
+    def _on_update_button_clicked(self) -> None:
+        if self.update_task_active:
+            return
+
+        if self.update_action_mode == "download":
+            self._start_update_download()
+            return
+
+        if self.update_action_mode == "open_download":
+            if self.downloaded_update_path is not None:
+                try:
+                    _open_path_in_shell(self.downloaded_update_path)
+                except Exception as exc:
+                    reason = _format_request_error(exc)
+                    self._set_update_status("update_status_failed", reason=reason)
+                    self.message_var.set(self._t("footer_update_failed", reason=reason))
+                else:
+                    self.message_var.set(
+                        self._t("footer_update_downloaded", path=str(self.downloaded_update_path))
+                    )
+                return
+            self._set_update_button_state("update_button_check", mode="check", enabled=True)
+
+        if self.update_action_mode == "open_release":
+            self._open_release_page()
+            return
+
+        self._start_update_check()
+
+    def _start_update_check(self) -> None:
+        if self.update_task_active:
+            return
+        self.update_task_active = True
+        self.downloaded_update_path = None
+        self._set_update_status("update_status_checking")
+        self._set_update_button_state("update_button_checking", mode="checking", enabled=False)
+        self.message_var.set(self._t("footer_update_checking"))
+        threading.Thread(
+            target=self._run_update_check,
+            name="plunger-update-check",
+            daemon=True,
+        ).start()
+
+    def _run_update_check(self) -> None:
+        try:
+            release_info = _fetch_latest_release_info(self.current_version)
+        except Exception as exc:
+            reason = _format_request_error(exc)
+            with suppress(Exception):
+                self.root.after(0, lambda: self._finish_update_check_error(reason))
+            return
+
+        with suppress(Exception):
+            self.root.after(0, lambda: self._finish_update_check(release_info))
+
+    def _finish_update_check(self, release_info: dict[str, Any]) -> None:
+        if self.closed:
+            return
+        self.update_task_active = False
+        self.latest_release_info = dict(release_info)
+        latest_version = str(release_info.get("latest_version", "")).strip() or self.current_version
+        asset_url = str(release_info.get("asset_url", "")).strip()
+
+        if bool(release_info.get("is_newer")):
+            if asset_url:
+                self._set_update_status("update_status_available_download", version=latest_version)
+                self._set_update_button_state("update_button_download", mode="download", enabled=True)
+            else:
+                self._set_update_status("update_status_available_release", version=latest_version)
+                self._set_update_button_state("update_button_open_release", mode="open_release", enabled=True)
+            self.message_var.set(self._t("footer_update_available", version=latest_version))
+            return
+
+        self._set_update_status("update_status_latest", version=latest_version)
+        self._set_update_button_state("update_button_check", mode="check", enabled=True)
+        self.message_var.set(self._t("footer_update_latest"))
+
+    def _finish_update_check_error(self, reason: str) -> None:
+        if self.closed:
+            return
+        self.update_task_active = False
+        self.latest_release_info = None
+        self.downloaded_update_path = None
+        self._set_update_status("update_status_failed", reason=reason)
+        self._set_update_button_state("update_button_check", mode="check", enabled=True)
+        self.message_var.set(self._t("footer_update_failed", reason=reason))
+
+    def _start_update_download(self) -> None:
+        if self.update_task_active:
+            return
+
+        release_info = self.latest_release_info or {}
+        asset_url = str(release_info.get("asset_url", "")).strip()
+        asset_name = str(release_info.get("asset_name", "")).strip()
+        if not asset_url or not asset_name:
+            self._open_release_page()
+            return
+
+        self.update_task_active = True
+        self._set_update_status("update_status_downloading", name=asset_name)
+        self._set_update_button_state("update_button_downloading", mode="downloading", enabled=False)
+        self.message_var.set(self._t("footer_update_downloading"))
+        threading.Thread(
+            target=self._run_update_download,
+            args=(asset_url, asset_name),
+            name="plunger-update-download",
+            daemon=True,
+        ).start()
+
+    def _run_update_download(self, asset_url: str, asset_name: str) -> None:
+        try:
+            target_path = _download_release_asset(asset_url, asset_name)
+        except Exception as exc:
+            reason = _format_request_error(exc)
+            with suppress(Exception):
+                self.root.after(0, lambda: self._finish_update_download_error(reason))
+            return
+
+        with suppress(Exception):
+            self.root.after(0, lambda: self._finish_update_download(target_path))
+
+    def _finish_update_download(self, target_path: Path) -> None:
+        if self.closed:
+            return
+        self.update_task_active = False
+        self.downloaded_update_path = target_path
+        self._set_update_status("update_status_downloaded", path=str(target_path))
+        self._set_update_button_state("update_button_open_download", mode="open_download", enabled=True)
+        self.message_var.set(self._t("footer_update_downloaded", path=str(target_path)))
+        with suppress(Exception):
+            _open_path_in_shell(target_path)
+
+    def _finish_update_download_error(self, reason: str) -> None:
+        if self.closed:
+            return
+        self.update_task_active = False
+        self._set_update_status("update_status_download_failed", reason=reason)
+        self._set_update_button_state("update_button_download", mode="download", enabled=True)
+        self.message_var.set(self._t("footer_update_download_failed", reason=reason))
+
+    def _open_release_page(self) -> None:
+        release_url = str((self.latest_release_info or {}).get("html_url", "")).strip() or GITHUB_RELEASES_PAGE_URL
+        try:
+            webbrowser.open(release_url)
+        except Exception as exc:
+            reason = _format_request_error(exc)
+            self._set_update_status("update_status_failed", reason=reason)
+            self.message_var.set(self._t("footer_update_failed", reason=reason))
+            return
+
+        self._set_update_button_state("update_button_open_release", mode="open_release", enabled=True)
+        if self.latest_release_info and self.latest_release_info.get("latest_version"):
+            latest_version = str(self.latest_release_info["latest_version"])
+            self._set_update_status("update_status_available_release", version=latest_version)
+        self.message_var.set(self._t("footer_update_release_opened"))
 
     def _toggle_proxy(self) -> None:
         if self.pending_action:
@@ -1571,26 +2145,17 @@ class ProxyDashboard:
         self._stop_existing_proxy_before_start(previous_started_at_ms)
         previous_health = self._fetch_health()
         self.pending_start_previous_started_at_ms = self._extract_started_at_ms(previous_health)
-        if _is_frozen_app():
-            self.process = EmbeddedProxyProcess(
-                self._build_proxy_cli_args(),
-                base_url=self.base_url,
-            )
-            self.process.start()
-        else:
-            command = [sys.executable, str(Path(__file__).with_name("plunger.py"))]
-            command.extend(self._build_proxy_cli_args())
-            creationflags = 0
-            for flag_name in ("CREATE_NO_WINDOW", "CREATE_NEW_PROCESS_GROUP"):
-                creationflags |= getattr(subprocess, flag_name, 0)
+        creationflags = 0
+        for flag_name in ("CREATE_NO_WINDOW", "CREATE_NEW_PROCESS_GROUP"):
+            creationflags |= getattr(subprocess, flag_name, 0)
 
-            self.process = subprocess.Popen(
-                command,
-                cwd=str(_app_base_dir()),
-                stdout=subprocess.DEVNULL,
-                stderr=subprocess.DEVNULL,
-                creationflags=creationflags,
-            )
+        self.process = subprocess.Popen(
+            self._build_proxy_command(),
+            cwd=str(_app_base_dir()),
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            creationflags=creationflags,
+        )
         self.pending_action = "start"
         self.pending_deadline = time.time() + (
             20.0 if self.pending_start_previous_started_at_ms is not None else 12.0
@@ -1600,6 +2165,12 @@ class ProxyDashboard:
 
     def _stop_proxy(self) -> None:
         self.pending_start_previous_started_at_ms = None
+        current_health = self._fetch_health()
+        supervisor_pid = _extract_positive_int((current_health or {}).get("supervisor_pid"))
+        if not supervisor_pid:
+            supervisor_pid = _read_supervisor_pid()
+        if supervisor_pid:
+            _terminate_pid_tree(supervisor_pid)
         with suppress(Exception):
             self._request_json("/control/shutdown", method="POST", timeout=1.2)
         self.pending_action = "stop"
@@ -1707,6 +2278,47 @@ class ProxyDashboard:
         self.latest_health = self._fetch_health()
         self._apply_health(self.latest_health)
 
+    def _load_recorded_events(self) -> list[dict[str, Any]]:
+        try:
+            payload = json.loads(EVENT_HISTORY_FILE.read_text(encoding="utf-8"))
+        except Exception:
+            return []
+
+        items = payload.get("events")
+        if not isinstance(items, list):
+            return []
+        return [dict(item) for item in items if isinstance(item, dict)]
+
+    def _summarize_recovery_counts(
+        self, events: list[dict[str, Any]]
+    ) -> tuple[int, int]:
+        today = datetime.now().date()
+        today_success = 0
+        history_success = 0
+
+        for event in events:
+            if not isinstance(event, dict) or event.get("kind") != "recovered":
+                continue
+
+            history_success += 1
+            event_date = None
+            try:
+                created_at_ms = int(event.get("created_at_ms"))
+            except (TypeError, ValueError):
+                created_at_ms = 0
+
+            if created_at_ms > 0:
+                event_date = datetime.fromtimestamp(created_at_ms / 1000).date()
+            else:
+                event_dt = self._parse_timestamp(str(event.get("timestamp", "")).strip())
+                if event_dt is not None:
+                    event_date = event_dt.date()
+
+            if event_date == today:
+                today_success += 1
+
+        return today_success, history_success
+
     def _apply_health(self, health: dict[str, Any] | None) -> None:
         running = health is not None
         self.action_var.set(self._t("action_off") if running else self._t("action_on"))
@@ -1732,6 +2344,12 @@ class ProxyDashboard:
             self.stat_value_vars["requests"].set(str(health.get("total", 0)))
             self.stat_value_vars["success"].set(str(health.get("recoveries_succeeded", 0)))
             self.stat_value_vars["triggers"].set(str(health.get("recoveries_triggered", 0)))
+            events = health.get("events", [])
+            if not isinstance(events, list):
+                events = self._load_recorded_events()
+            today_success, history_success = self._summarize_recovery_counts(events)
+            self.stat_value_vars["today_success"].set(str(today_success))
+            self.stat_value_vars["history_success"].set(str(history_success))
             active_sessions = health.get("active_sessions")
             if not isinstance(active_sessions, list):
                 active_sessions = [health.get("active_session")] if health.get("active_session") else []
@@ -1742,9 +2360,6 @@ class ProxyDashboard:
                 session for session in pending_tool_waits if isinstance(session, dict)
             )
             self._fill_active_sessions(active_sessions)
-            events = health.get("events", [])
-            if not isinstance(events, list):
-                events = []
             filtered_events = self._filter_events(
                 events,
                 started_at=str(health.get("started_at", "")).strip(),
@@ -1760,8 +2375,11 @@ class ProxyDashboard:
             self.listen_var.set(self._t("listen_prefix", value=self.base_url))
             self.upstream_var.set(self._t("upstream_prefix", value=self._t(upstream_label_key)))
             self._fill_active_sessions([])
-            for variable in self.stat_value_vars.values():
-                variable.set("0")
+            for key in ("requests", "success", "triggers"):
+                self.stat_value_vars[key].set("0")
+            today_success, history_success = self._summarize_recovery_counts(self._load_recorded_events())
+            self.stat_value_vars["today_success"].set(str(today_success))
+            self.stat_value_vars["history_success"].set(str(history_success))
             self._fill_events([], current_run_only=self.current_run_only_var.get())
             if not self.pending_action:
                 self.message_var.set(self._t("footer_idle"))
@@ -1875,6 +2493,7 @@ class ProxyDashboard:
             if isinstance(session, dict)
             and str(session.get("status", "")).strip() in {
                 "running",
+                "recovering",
                 "waiting_tool_result",
                 "tool_result_timeout",
             }
@@ -1889,7 +2508,13 @@ class ProxyDashboard:
 
         for session in normalized:
             status_raw = str(session.get("status", "")).strip()
-            if status_raw == "running":
+            reason = str(session.get("reason", "")).strip()
+            reason_display = self._humanize_recovery_reason(reason) if status_raw == "recovering" else reason
+            player_hint = self._active_session_player_hint(session, reason=reason)
+            if status_raw == "recovering":
+                status_text = self._t("active_status_recovering")
+                tag = "recovering"
+            elif status_raw == "running":
                 status_text = self._t("active_status_running")
                 tag = "running"
             elif status_raw == "tool_result_timeout":
@@ -1914,7 +2539,12 @@ class ProxyDashboard:
             client_label = str(session.get("client_label", "")).strip() or "-"
 
             last_user_preview = str(session.get("last_user_text_preview", "")).strip()
-            input_display = last_user_preview if last_user_preview else "-"
+            input_display = (
+                player_hint
+                or (reason_display if status_raw == "recovering" and reason_display else "")
+                or last_user_preview
+                or "-"
+            )
 
             self.active_tree.insert(
                 "", "end",
@@ -1931,6 +2561,7 @@ class ProxyDashboard:
             if isinstance(session, dict)
             and str(session.get("status", "")).strip() in {
                 "running",
+                "recovering",
                 "waiting_tool_result",
                 "tool_result_timeout",
             }
@@ -1967,12 +2598,62 @@ class ProxyDashboard:
             return False
         return True
 
+    def _humanize_recovery_reason(self, reason: str) -> str:
+        normalized = str(reason or "").strip()
+        if not normalized:
+            return ""
+
+        lowered = normalized.lower()
+        if "no available channel" in lowered or "model_not_found" in lowered:
+            return self._t("active_reason_station_no_channel")
+        if "http 503" in lowered or "upstream unavailable" in lowered:
+            return self._t("active_reason_station_503")
+        if "http 502" in lowered or "bad gateway" in lowered:
+            return self._t("active_reason_station_502")
+        if "stall after" in lowered or "timeout" in lowered:
+            return self._t("active_reason_station_timeout")
+        return normalized
+
+    def _active_session_player_hint(self, session: Any, *, reason: str = "") -> str:
+        if not isinstance(session, dict):
+            return ""
+
+        if str(session.get("status", "")).strip() != "recovering":
+            return ""
+
+        try:
+            recovery_attempt = int(session.get("recovery_attempt", 0) or 0)
+        except (TypeError, ValueError):
+            recovery_attempt = 0
+        if recovery_attempt < 3:
+            return ""
+
+        normalized_reason = str(reason or session.get("reason", "")).strip().lower()
+        if not normalized_reason:
+            return ""
+
+        issue_markers = (
+            "no available channel",
+            "model_not_found",
+            "http 503",
+            "http 502",
+            "bad gateway",
+            "upstream unavailable",
+            "proxy_error",
+            "stall after",
+            "timeout",
+            "connection",
+        )
+        if any(marker in normalized_reason for marker in issue_markers):
+            return self._t("active_hint_station_issue")
+        return ""
+
     def _format_active_session(self, session: Any) -> str:
         if not isinstance(session, dict):
             return self._t("active_none")
 
         status = str(session.get("status", "")).strip()
-        if status not in {"running", "waiting_tool_result", "tool_result_timeout"}:
+        if status not in {"running", "recovering", "waiting_tool_result", "tool_result_timeout"}:
             return self._t("active_none")
 
         endpoint = self._endpoint_label(str(session.get("endpoint_label", "")).strip())
@@ -2001,8 +2682,22 @@ class ProxyDashboard:
             wait_seconds = int(session.get("wait_seconds", 0) or 0)
         except (TypeError, ValueError):
             wait_seconds = 0
+        try:
+            recovery_attempt = int(session.get("recovery_attempt", 0) or 0)
+        except (TypeError, ValueError):
+            recovery_attempt = 0
+        reason = str(session.get("reason", "")).strip()
+        reason_display = self._humanize_recovery_reason(reason) if status == "recovering" else reason
+        player_hint = self._active_session_player_hint(session, reason=reason)
 
-        if status == "running":
+        if status == "recovering":
+            headline = self._t(
+                "active_recovering",
+                endpoint=endpoint,
+                updated_at=updated_at,
+                attempt=max(1, recovery_attempt),
+            )
+        elif status == "running":
             headline = self._t("active_running", endpoint=endpoint, updated_at=updated_at)
         elif status == "tool_result_timeout":
             headline = self._t(
@@ -2023,6 +2718,10 @@ class ProxyDashboard:
             lines.append(self._t("active_partial_chars_label", chars=partial_chars))
         if client_label:
             lines.append(self._t("active_client_label", client=client_label))
+        if player_hint:
+            lines.append(self._t("active_hint_label", hint=player_hint))
+        if reason_display:
+            lines.append(self._t("active_reason_label", reason=reason_display))
         if tool_label:
             lines.append(self._t("active_tools_label", tools=tool_label))
         if status != "running" and wait_seconds > 0:
@@ -2231,16 +2930,6 @@ class ProxyDashboard:
         if self.after_id is not None:
             self.root.after_cancel(self.after_id)
             self.after_id = None
-
-        if self.process and self.process.poll() is None:
-            current_started_at_ms = self._extract_started_at_ms(self._fetch_health())
-            with suppress(Exception):
-                self._request_json("/control/shutdown", method="POST", timeout=1.2)
-            if not self._wait_for_proxy_exit(current_started_at_ms, timeout=8.0):
-                log.warning(
-                    "Proxy did not exit after window close shutdown request; terminating tracked process"
-                )
-                self._terminate_tracked_process(wait_timeout=1.5)
         self.root.destroy()
 
 

@@ -1,5 +1,6 @@
 import subprocess
 from argparse import Namespace
+from datetime import datetime
 
 import plunger_ui
 
@@ -62,45 +63,14 @@ def _make_dashboard(process: FakeProcess) -> plunger_ui.ProxyDashboard:
     return dashboard
 
 
-def test_on_close_waits_for_graceful_shutdown_before_terminating() -> None:
+def test_on_close_only_closes_window_without_stopping_proxy() -> None:
     dashboard = _make_dashboard(FakeProcess())
-    requests: list[tuple[tuple[object, ...], dict[str, object]]] = []
-    terminate_calls: list[float] = []
-
-    dashboard._fetch_health = lambda: {"started_at_ms": 123}
-    dashboard._request_json = (
-        lambda *args, **kwargs: requests.append((args, kwargs)) or {"status": "stopping"}
-    )
-    dashboard._wait_for_proxy_exit = lambda started_at_ms, timeout: (
-        started_at_ms == 123 and timeout == 8.0
-    )
-    dashboard._terminate_tracked_process = lambda wait_timeout: terminate_calls.append(wait_timeout)
-
     dashboard._on_close()
 
     assert dashboard.closed is True
     assert dashboard.after_id is None
     assert dashboard.root.cancelled == "after-1"
     assert dashboard.root.destroyed is True
-    assert len(requests) == 1
-    assert requests[0][0] == ("/control/shutdown",)
-    assert requests[0][1] == {"method": "POST", "timeout": 1.2}
-    assert terminate_calls == []
-
-
-def test_on_close_terminates_when_graceful_shutdown_stalls() -> None:
-    dashboard = _make_dashboard(FakeProcess())
-    terminate_calls: list[float] = []
-
-    dashboard._fetch_health = lambda: {"started_at_ms": 321}
-    dashboard._request_json = lambda *args, **kwargs: {"status": "stopping"}
-    dashboard._wait_for_proxy_exit = lambda started_at_ms, timeout: False
-    dashboard._terminate_tracked_process = lambda wait_timeout: terminate_calls.append(wait_timeout)
-
-    dashboard._on_close()
-
-    assert dashboard.root.destroyed is True
-    assert terminate_calls == [1.5]
 
 
 def test_wait_for_proxy_exit_does_not_finish_while_tracked_process_is_still_running(
@@ -136,21 +106,8 @@ def test_write_gui_state_is_best_effort(monkeypatch) -> None:
     plunger_ui._write_gui_state()
 
 
-def test_start_proxy_uses_embedded_runner_for_frozen_build(monkeypatch) -> None:
-    created: list[FakeEmbeddedProcess] = []
-
-    class FakeEmbeddedProcess:
-        def __init__(self, cli_args: list[str], *, base_url: str) -> None:
-            self.cli_args = cli_args
-            self.base_url = base_url
-            self.started = False
-            created.append(self)
-
-        def start(self) -> None:
-            self.started = True
-
-        def poll(self) -> int | None:
-            return None
+def test_start_proxy_uses_hidden_headless_command_for_frozen_build(monkeypatch) -> None:
+    popen_calls: list[tuple[list[str], dict[str, object]]] = []
 
     dashboard = object.__new__(plunger_ui.ProxyDashboard)
     dashboard.args = Namespace(
@@ -175,20 +132,19 @@ def test_start_proxy_uses_embedded_runner_for_frozen_build(monkeypatch) -> None:
     dashboard._t = lambda key, **kwargs: key
 
     monkeypatch.setattr(plunger_ui, "_is_frozen_app", lambda: True)
-    monkeypatch.setattr(plunger_ui, "EmbeddedProxyProcess", FakeEmbeddedProcess)
     monkeypatch.setattr(
         plunger_ui.subprocess,
         "Popen",
-        lambda *args, **kwargs: (_ for _ in ()).throw(AssertionError("Popen should not be used")),
+        lambda command, **kwargs: popen_calls.append((command, kwargs)) or FakeProcess(),
     )
 
     dashboard._start_proxy()
 
-    assert len(created) == 1
-    assert dashboard.process is created[0]
-    assert created[0].started is True
-    assert created[0].base_url == "http://127.0.0.1:8462"
-    assert created[0].cli_args == [
+    assert len(popen_calls) == 1
+    command, kwargs = popen_calls[0]
+    assert command == [
+        plunger_ui.sys.executable,
+        "--headless",
         "--port",
         "8462",
         "--timeout",
@@ -197,4 +153,147 @@ def test_start_proxy_uses_embedded_runner_for_frozen_build(monkeypatch) -> None:
         "-1",
         "--watch-interval",
         "1.0",
+        "--aggressive-autoevolve",
+        "--enable-supervisor",
     ]
+    assert kwargs["cwd"] == str(plunger_ui._app_base_dir())
+
+
+def test_stop_proxy_terminates_supervisor_before_shutdown(monkeypatch) -> None:
+    dashboard = object.__new__(plunger_ui.ProxyDashboard)
+    dashboard.closed = False
+    dashboard.pending_start_previous_started_at_ms = None
+    dashboard.pending_action = None
+    dashboard.pending_deadline = 0.0
+    dashboard._fetch_health = lambda: {"supervisor_pid": 4321}
+    requests: list[tuple[tuple[object, ...], dict[str, object]]] = []
+    terminated: list[int] = []
+    dashboard._request_json = (
+        lambda *args, **kwargs: requests.append((args, kwargs)) or {"status": "stopping"}
+    )
+    dashboard._set_busy = lambda message: None
+    dashboard._poll_pending_action = lambda: None
+    dashboard._t = lambda key, **kwargs: key
+
+    monkeypatch.setattr(plunger_ui, "_terminate_pid_tree", lambda pid: terminated.append(pid))
+    monkeypatch.setattr(plunger_ui, "_read_supervisor_pid", lambda: 0)
+
+    dashboard._stop_proxy()
+
+    assert terminated == [4321]
+    assert requests == [(("/control/shutdown",), {"method": "POST", "timeout": 1.2})]
+
+
+def test_summarize_recovery_counts_tracks_today_and_history(monkeypatch) -> None:
+    class FixedDateTime(datetime):
+        @classmethod
+        def now(cls, tz=None) -> "FixedDateTime":
+            return cls(2026, 3, 24, 12, 0, 0)
+
+    dashboard = object.__new__(plunger_ui.ProxyDashboard)
+    dashboard._parse_timestamp = plunger_ui.ProxyDashboard._parse_timestamp.__get__(
+        dashboard, plunger_ui.ProxyDashboard
+    )
+
+    monkeypatch.setattr(plunger_ui, "datetime", FixedDateTime)
+
+    events = [
+        {
+            "kind": "recovered",
+            "created_at_ms": int(datetime(2026, 3, 24, 9, 0, 0).timestamp() * 1000),
+        },
+        {
+            "kind": "recovered",
+            "created_at_ms": int(datetime(2026, 3, 23, 22, 0, 0).timestamp() * 1000),
+        },
+        {
+            "kind": "recovered",
+            "timestamp": "2026-03-24 08:30:00",
+        },
+        {
+            "kind": "disconnect",
+            "created_at_ms": int(datetime(2026, 3, 24, 10, 0, 0).timestamp() * 1000),
+        },
+    ]
+
+    today_success, history_success = dashboard._summarize_recovery_counts(events)
+
+    assert today_success == 2
+    assert history_success == 3
+
+
+def test_is_newer_version_handles_v_prefix_and_prerelease() -> None:
+    assert plunger_ui._is_newer_version("v0.2.0", "0.1.9") is True
+    assert plunger_ui._is_newer_version("0.1.0", "v0.1") is False
+    assert plunger_ui._is_newer_version("0.1.0-rc1", "0.1.0") is False
+
+
+def test_fetch_latest_release_info_prefers_windows_zip_asset(monkeypatch) -> None:
+    monkeypatch.setattr(
+        plunger_ui,
+        "_github_request_json",
+        lambda url, timeout=8.0: {
+            "tag_name": "v0.2.0",
+            "html_url": "https://github.com/maouzju/plunger/releases/tag/v0.2.0",
+            "assets": [
+                {
+                    "name": "notes.txt",
+                    "browser_download_url": "https://example.com/notes.txt",
+                },
+                {
+                    "name": "Plunger.exe",
+                    "browser_download_url": "https://example.com/Plunger.exe",
+                },
+                {
+                    "name": "Plunger-windows.zip",
+                    "browser_download_url": "https://example.com/Plunger-windows.zip",
+                },
+            ],
+        },
+    )
+    monkeypatch.setattr(plunger_ui.os, "name", "nt")
+
+    info = plunger_ui._fetch_latest_release_info("0.1.0")
+
+    assert info["latest_version"] == "0.2.0"
+    assert info["is_newer"] is True
+    assert info["asset_name"] == "Plunger-windows.zip"
+    assert info["asset_url"] == "https://example.com/Plunger-windows.zip"
+
+
+def test_format_active_session_shows_recovering_retry_state() -> None:
+    dashboard = object.__new__(plunger_ui.ProxyDashboard)
+    dashboard.language = "zh_CN"
+    dashboard._t = plunger_ui.ProxyDashboard._t.__get__(dashboard, plunger_ui.ProxyDashboard)
+    dashboard._endpoint_label = plunger_ui.ProxyDashboard._endpoint_label.__get__(
+        dashboard, plunger_ui.ProxyDashboard
+    )
+    dashboard._request_summary_is_usable = (
+        plunger_ui.ProxyDashboard._request_summary_is_usable.__get__(
+            dashboard, plunger_ui.ProxyDashboard
+        )
+    )
+    dashboard._format_active_session = plunger_ui.ProxyDashboard._format_active_session.__get__(
+        dashboard, plunger_ui.ProxyDashboard
+    )
+
+    formatted = dashboard._format_active_session(
+        {
+            "status": "recovering",
+            "endpoint_label": "messages",
+            "updated_at": "2026-03-29 15:20:00",
+            "request_summary": "为我在这个文件夹下设计一个",
+            "model": "claude-sonnet-4-6",
+            "client_label": "127.0.0.1:10101",
+            "recovery_attempt": 4,
+            "reason": 'HTTP 503: {"error":{"message":"No available channel"}}',
+            "last_user_text_preview": "为我在这个文件夹下设计一个",
+            "partial_text_preview": "",
+            "partial_chars": 0,
+        }
+    )
+
+    assert "第 4 次重试" in formatted
+    assert "提示：" in formatted
+    assert "中转站" in formatted
+    assert "可用通道" in formatted

@@ -19,6 +19,7 @@ import atexit
 import json
 import logging
 import os
+import py_compile
 import random
 import re
 import signal
@@ -103,6 +104,21 @@ ANTHROPIC_PING_FRAME = b'event: ping\ndata: {"type":"ping"}\n\n'
 WATCHDOG_POLL_INTERVAL = 1.0
 WATCHDOG_STARTUP_GRACE = 20.0
 WATCHDOG_FAILURE_GRACE = 12.0
+WATCHDOG_PORT_OPEN_FAILURE_GRACE = 120.0
+SUPERVISOR_POLL_INTERVAL = 2.0
+SUPERVISOR_STARTUP_GRACE = 25.0
+SUPERVISOR_FAILURE_GRACE = 15.0
+SUPERVISOR_RESTART_BACKOFF = 2.0
+SUPERVISOR_FAILURE_WINDOW_SECONDS = 180.0
+SUPERVISOR_FAILURE_BURST_THRESHOLD = 3
+SUPERVISOR_DISCONNECT_WINDOW_SECONDS = 90.0
+SUPERVISOR_DISCONNECT_BURST_THRESHOLD = 3
+SUPERVISOR_TIMEOUT_MAX = 180.0
+SUPERVISOR_TIMEOUT_GROWTH = 1.25
+SUPERVISOR_TIMEOUT_DECAY_SECONDS = 600.0
+SUPERVISOR_INCIDENT_LIMIT = 200
+AGGRESSIVE_EVOLVE_COOLDOWN_SECONDS = 120.0
+AGGRESSIVE_TIMEOUT_FLOOR = 75.0
 
 CLAUDE_SETTINGS = CLAUDE_DIR / "settings.json"
 STATE_FILE = CLAUDE_DIR / ".plunger_state.json"
@@ -111,6 +127,12 @@ ACTIVE_SESSIONS_FILE = RECOVERY_DIR / "active_sessions.json"
 EVENT_HISTORY_FILE = RECOVERY_DIR / "events.json"
 WATCHDOG_LOG_FILE = RECOVERY_DIR / "watchdog.log"
 SERVICE_LOG_FILE = RECOVERY_DIR / "service.log"
+SUPERVISOR_LOG_FILE = RECOVERY_DIR / "supervisor.log"
+SUPERVISOR_STATE_FILE = RECOVERY_DIR / "supervisor_state.json"
+SUPERVISOR_INCIDENTS_FILE = RECOVERY_DIR / "supervisor_incidents.json"
+AGGRESSIVE_POLICY_FILE = RECOVERY_DIR / "aggressive_policy.py"
+AGGRESSIVE_STATE_FILE = RECOVERY_DIR / "aggressive_state.json"
+AGGRESSIVE_LOG_FILE = RECOVERY_DIR / "aggressive.log"
 CC_SWITCH_SETTINGS = Path.home() / ".cc-switch" / "settings.json"
 CODEX_DIR = Path.home() / ".codex"
 CODEX_CONFIG = CODEX_DIR / "config.toml"
@@ -527,6 +549,70 @@ def _append_watchdog_log(message: str) -> None:
         pass
 
 
+def _append_supervisor_log(message: str) -> None:
+    try:
+        SUPERVISOR_LOG_FILE.parent.mkdir(parents=True, exist_ok=True)
+        with SUPERVISOR_LOG_FILE.open("a", encoding="utf-8", newline="\n") as handle:
+            handle.write(f"[{_timestamp_now()}] {message}\n")
+    except Exception:
+        pass
+
+
+def _append_aggressive_log(message: str) -> None:
+    try:
+        AGGRESSIVE_LOG_FILE.parent.mkdir(parents=True, exist_ok=True)
+        with AGGRESSIVE_LOG_FILE.open("a", encoding="utf-8", newline="\n") as handle:
+            handle.write(f"[{_timestamp_now()}] {message}\n")
+    except Exception:
+        pass
+
+
+def _write_supervisor_state(payload: dict[str, Any]) -> None:
+    try:
+        state = dict(payload)
+        state["updated_at"] = _timestamp_now()
+        _write_json(SUPERVISOR_STATE_FILE, state)
+    except Exception:
+        pass
+
+
+def _clear_supervisor_state(expected_pid: int | None = None) -> None:
+    if expected_pid:
+        try:
+            payload = _read_json(SUPERVISOR_STATE_FILE)
+        except Exception:
+            payload = None
+        if isinstance(payload, dict):
+            try:
+                current_pid = int(payload.get("pid") or 0)
+            except Exception:
+                current_pid = 0
+            if current_pid and current_pid != expected_pid:
+                return
+    with suppress(FileNotFoundError):
+        SUPERVISOR_STATE_FILE.unlink()
+
+
+def _load_supervisor_state() -> dict[str, Any] | None:
+    if not SUPERVISOR_STATE_FILE.exists():
+        return None
+    try:
+        payload = _read_json(SUPERVISOR_STATE_FILE)
+    except Exception:
+        return None
+    return payload if isinstance(payload, dict) else None
+
+
+def _read_json_file(path: Path) -> dict[str, Any] | None:
+    if not path.exists():
+        return None
+    try:
+        payload = _read_json(path)
+    except Exception:
+        return None
+    return payload if isinstance(payload, dict) else None
+
+
 def _terminate_pid_best_effort(pid: int | None) -> None:
     """End a child process without raising (used for safety watchdog teardown)."""
     if pid is None or pid <= 0:
@@ -577,11 +663,19 @@ def _process_exists(pid: int) -> bool:
 def _proxy_health_is_ok(listen_port: int) -> bool:
     try:
         # Bypass system proxies so watchdog health checks hit the local service directly.
-        with LOCAL_OPENER.open(f"http://{LOCAL_HOST}:{listen_port}/health", timeout=1.5) as response:
+        # Use the lightweight liveness endpoint so watchdog probes never depend on
+        # event-history snapshots or recovery-state file reads.
+        with LOCAL_OPENER.open(f"http://{LOCAL_HOST}:{listen_port}/healthz", timeout=1.0) as response:
             payload = json.loads(response.read().decode("utf-8"))
     except Exception:
         return False
     return payload.get("status") == "ok"
+
+
+def _watchdog_failure_grace_for_port(listen_port: int) -> float:
+    if _local_port_is_open(listen_port):
+        return WATCHDOG_PORT_OPEN_FAILURE_GRACE
+    return WATCHDOG_FAILURE_GRACE
 
 
 def _request_local_json(
@@ -1479,7 +1573,7 @@ class RecoveryStore:
         items = [
             dict(item)
             for item in self.active_sessions.values()
-            if str(item.get("status", "")).strip() == "running"
+            if str(item.get("status", "")).strip() in {"running", "recovering"}
         ]
         items.sort(key=lambda item: str(item.get("updated_at", "")), reverse=True)
         return items
@@ -1493,6 +1587,9 @@ class RecoveryStore:
         if str(session.get("status", "running")).strip() != "running":
             return
 
+        session_status = "recovering" if state.in_recovery else str(session.get("status", "running")).strip() or "running"
+        reason = state.recovery_reason if state.in_recovery else str(session.get("reason", "")).strip()
+
         payload = {
             "session_id": session_id,
             "endpoint": session.get("endpoint", ""),
@@ -1501,8 +1598,9 @@ class RecoveryStore:
             "upstream": session.get("upstream", ""),
             "started_at": session.get("started_at", ""),
             "updated_at": _timestamp_now(),
-            "status": session.get("status", "running"),
-            "reason": session.get("reason", ""),
+            "status": session_status,
+            "reason": _shorten_text(reason, 180),
+            "recovery_attempt": state.recovery_attempt,
             "request_summary": session.get("request_summary", ""),
             "continued_from_session_id": session.get("continued_from_session_id", ""),
             "client_label": session.get("client_label", ""),
@@ -1600,6 +1698,111 @@ class EventHistory:
             )
         except Exception as exc:
             log.warning("Failed to persist event history: %s", exc)
+
+
+class IncidentHistory:
+    def __init__(self, path: Path = SUPERVISOR_INCIDENTS_FILE, limit: int = SUPERVISOR_INCIDENT_LIMIT) -> None:
+        self.path = path
+        self.limit = limit
+        self.incidents = self._load()
+
+    def add(self, kind: str, reason: str, *, meta: dict[str, Any] | None = None) -> dict[str, Any]:
+        incident = {
+            "id": f"{int(time.time() * 1000)}-{os.getpid()}",
+            "created_at_ms": int(time.time() * 1000),
+            "timestamp": _timestamp_now(),
+            "kind": kind,
+            "reason": _shorten_text(reason, 240),
+            "meta": dict(meta or {}),
+        }
+        self.incidents = [incident, *self.incidents[: self.limit - 1]]
+        self._persist()
+        return incident
+
+    def _load(self) -> list[dict[str, Any]]:
+        if not self.path.exists():
+            return []
+        try:
+            payload = _read_json(self.path)
+        except Exception:
+            return []
+
+        items = payload.get("incidents")
+        if not isinstance(items, list):
+            return []
+        return [dict(item) for item in items[: self.limit] if isinstance(item, dict)]
+
+    def _persist(self) -> None:
+        try:
+            _write_json(
+                self.path,
+                {
+                    "updated_at": _timestamp_now(),
+                    "incidents": self.incidents[: self.limit],
+                },
+            )
+        except Exception:
+            pass
+
+
+def _load_aggressive_state() -> dict[str, Any]:
+    return _read_json_file(AGGRESSIVE_STATE_FILE) or {}
+
+
+def _write_aggressive_state(payload: dict[str, Any]) -> None:
+    try:
+        state = dict(payload)
+        state["updated_at"] = _timestamp_now()
+        _write_json(AGGRESSIVE_STATE_FILE, state)
+    except Exception:
+        pass
+
+
+def _load_aggressive_policy() -> dict[str, Any]:
+    if not AGGRESSIVE_POLICY_FILE.exists():
+        return {}
+
+    namespace: dict[str, Any] = {}
+    try:
+        exec(AGGRESSIVE_POLICY_FILE.read_text(encoding="utf-8"), namespace)
+    except Exception as exc:
+        _append_aggressive_log(f"failed to load aggressive policy: {exc}")
+        return {}
+
+    payload = namespace.get("POLICY")
+    return dict(payload) if isinstance(payload, dict) else {}
+
+
+def _write_aggressive_policy(policy: dict[str, Any], *, reason: str, trigger_ids: list[str]) -> bool:
+    AGGRESSIVE_POLICY_FILE.parent.mkdir(parents=True, exist_ok=True)
+    rendered = (
+        "# Auto-generated by Plunger aggressive evolver.\n"
+        f"# generated_at = {_timestamp_now()}\n"
+        f"# reason = {reason}\n"
+        f"# trigger_ids = {', '.join(trigger_ids)}\n\n"
+        f"POLICY = {json.dumps(policy, ensure_ascii=True, indent=2)}\n"
+    )
+    try:
+        AGGRESSIVE_POLICY_FILE.write_text(rendered, encoding="utf-8", newline="\n")
+        py_compile.compile(str(AGGRESSIVE_POLICY_FILE), doraise=True)
+        return True
+    except Exception as exc:
+        _append_aggressive_log(f"failed to write aggressive policy: {exc}")
+        return False
+
+
+def _policy_float(policy: dict[str, Any], key: str, default: float) -> float:
+    try:
+        return float(policy.get(key, default))
+    except (TypeError, ValueError):
+        return float(default)
+
+
+def _policy_int(policy: dict[str, Any], key: str, default: int) -> int:
+    try:
+        return int(policy.get(key, default))
+    except (TypeError, ValueError):
+        return int(default)
 
 
 class CodexConfigManager:
@@ -2115,6 +2318,9 @@ class StreamState:
     completed: bool = False
     recovery_triggered: bool = False
     request_summary: str = ""
+    in_recovery: bool = False
+    recovery_attempt: int = 0
+    recovery_reason: str = ""
     awaiting_tool_result: bool = False
     tool_names: list[str] = field(default_factory=list)
     done_sent: bool = False
@@ -2228,6 +2434,7 @@ class ResilientProxy:
         *,
         max_request_body_bytes: int | None = None,
         safe_resume_body_bytes: int | None = None,
+        supervisor_pid: int | None = None,
     ):
         self.settings_manager = settings_manager
         self.stall_timeout = stall_timeout
@@ -2249,6 +2456,7 @@ class ResilientProxy:
             ),
         )
         self.safety_watchdog_pid: int | None = None
+        self.supervisor_pid: int | None = supervisor_pid
         self.first_byte_timeout = max(MIN_FIRST_BYTE_TIMEOUT, stall_timeout * 1.5)
         self.visible_output_timeout = max(DEFAULT_VISIBLE_OUTPUT_TIMEOUT, stall_timeout)
         self.direct_body_timeout = max(stall_timeout, 30.0)
@@ -2656,6 +2864,20 @@ class ResilientProxy:
     async def handle_health(self, _request: web.Request) -> web.Response:
         return web.json_response(self._build_health_payload())
 
+    def _build_liveness_payload(self) -> dict[str, Any]:
+        return {
+            "status": "ok",
+            "listen": self.settings_manager.proxy_url,
+            "started_at": self.started_at,
+            "started_at_ms": self.started_at_ms,
+            "pid": os.getpid(),
+            "safety_watchdog_pid": self.safety_watchdog_pid,
+            "supervisor_pid": self.supervisor_pid,
+        }
+
+    async def handle_healthz(self, _request: web.Request) -> web.Response:
+        return web.json_response(self._build_liveness_payload())
+
     async def handle_shutdown(self, request: web.Request) -> web.Response:
         shutdown_mode = str(request.query.get("mode", "manual")).strip().lower() or "manual"
         skip_restore = _shutdown_skips_restore(shutdown_mode)
@@ -2720,6 +2942,7 @@ class ResilientProxy:
             "upstream_source": self.settings_manager.current_upstream_source,
             "started_at": self.started_at,
             "started_at_ms": self.started_at_ms,
+            "pid": os.getpid(),
             "stall_timeout": self.stall_timeout,
             "first_byte_timeout": self.first_byte_timeout,
             "visible_output_timeout": self.visible_output_timeout,
@@ -2731,6 +2954,7 @@ class ResilientProxy:
             "responses_visible_output_timeout": self.visible_output_timeout * 2,
             "heartbeat_interval": self.heartbeat_interval,
             "safety_watchdog_pid": self.safety_watchdog_pid,
+            "supervisor_pid": self.supervisor_pid,
             "active_session": active_sessions[0] if active_sessions else None,
             "active_sessions": active_sessions,
             "active_sessions_count": len(active_sessions),
@@ -2773,7 +2997,14 @@ class ResilientProxy:
         state: StreamState,
         attempt: int,
         reason: str,
+        *,
+        session: dict[str, Any] | None = None,
     ) -> None:
+        state.in_recovery = True
+        state.recovery_attempt = max(state.recovery_attempt, attempt + 1)
+        state.recovery_reason = str(reason).strip()
+        if session is not None:
+            self.recovery_store.track_active_session(session, state)
         if state.recovery_triggered:
             return
         state.recovery_triggered = True
@@ -2901,7 +3132,7 @@ class ResilientProxy:
                 last_error = "no upstream is available"
                 last_status = 503
                 if self._should_retry(attempt):
-                    self._trigger_recovery(endpoint, state, attempt, last_error)
+                    self._trigger_recovery(endpoint, state, attempt, last_error, session=session)
                     attempt += 1
                     await asyncio.sleep(_retry_delay(attempt))
                     continue
@@ -2988,7 +3219,7 @@ class ResilientProxy:
                     await client_session.close()
 
             if self._should_retry(attempt):
-                self._trigger_recovery(endpoint, state, attempt, last_error)
+                self._trigger_recovery(endpoint, state, attempt, last_error, session=session)
                 attempt += 1
                 await asyncio.sleep(_retry_delay(attempt))
                 continue
@@ -3024,7 +3255,7 @@ class ResilientProxy:
                 last_error = "no upstream is available"
                 last_status = 503
                 if self._should_retry(attempt):
-                    self._trigger_recovery(endpoint, state, attempt, last_error)
+                    self._trigger_recovery(endpoint, state, attempt, last_error, session=session)
                     attempt += 1
                     await asyncio.sleep(_retry_delay(attempt))
                     continue
@@ -3197,7 +3428,7 @@ class ResilientProxy:
                     await client_session.close()
 
             if self._should_retry(attempt):
-                self._trigger_recovery(endpoint, state, attempt, last_error)
+                self._trigger_recovery(endpoint, state, attempt, last_error, session=session)
                 attempt += 1
                 await asyncio.sleep(_retry_delay(attempt))
                 continue
@@ -3617,7 +3848,7 @@ class ResilientProxy:
                         app_type="claude",
                     )
                     if not upstream:
-                        self._trigger_recovery("/v1/messages", state, attempt, "no upstream is available")
+                        self._trigger_recovery("/v1/messages", state, attempt, "no upstream is available", session=session)
                         attempt += 1
                         await asyncio.sleep(_retry_delay(attempt))
                         continue
@@ -3670,24 +3901,24 @@ class ResilientProxy:
                         return response
                 except _StreamTimeout as exc:
                     log.warning("   STALL: %s", exc)
-                    self._trigger_recovery("/v1/messages", state, attempt, str(exc))
+                    self._trigger_recovery("/v1/messages", state, attempt, str(exc), session=session)
                 except asyncio.TimeoutError:
                     log.warning("   STALL: %.1fs with no data", self.stall_timeout)
-                    self._trigger_recovery("/v1/messages", state, attempt, f"stall after {self.stall_timeout:.1f}s")
+                    self._trigger_recovery("/v1/messages", state, attempt, f"stall after {self.stall_timeout:.1f}s", session=session)
                 except aiohttp.ClientError as exc:
                     if _is_downstream_disconnect(req, exc, client_stream):
                         self.recovery_store.mark_interrupted(session, state, "client_disconnected")
                         log.info("   CLIENT CLOSED /v1/messages: %s", exc)
                         return response
                     log.warning("   CONN ERROR: %s", exc)
-                    self._trigger_recovery("/v1/messages", state, attempt, str(exc))
+                    self._trigger_recovery("/v1/messages", state, attempt, str(exc), session=session)
                 except OSError as exc:
                     if _is_downstream_disconnect(req, exc, client_stream):
                         self.recovery_store.mark_interrupted(session, state, "client_disconnected")
                         log.info("   CLIENT CLOSED /v1/messages: %s", exc)
                         return response
                     log.warning("   CONN ERROR: %s", exc)
-                    self._trigger_recovery("/v1/messages", state, attempt, str(exc))
+                    self._trigger_recovery("/v1/messages", state, attempt, str(exc), session=session)
                 except _UpstreamClientError as exc:
                     if _is_prefill_rejection(exc) and not prefill_disabled:
                         prefill_disabled = True
@@ -3773,7 +4004,7 @@ class ResilientProxy:
                         app_type="codex",
                     )
                     if not upstream:
-                        self._trigger_recovery("/v1/responses", state, attempt, "no upstream is available")
+                        self._trigger_recovery("/v1/responses", state, attempt, "no upstream is available", session=session)
                         attempt += 1
                         await asyncio.sleep(_retry_delay(attempt))
                         continue
@@ -3810,24 +4041,24 @@ class ResilientProxy:
                         return response
                 except _StreamTimeout as exc:
                     log.warning("   STALL: %s", exc)
-                    self._trigger_recovery("/v1/responses", state, attempt, str(exc))
+                    self._trigger_recovery("/v1/responses", state, attempt, str(exc), session=session)
                 except asyncio.TimeoutError:
                     log.warning("   STALL: %.1fs with no data", self.stall_timeout)
-                    self._trigger_recovery("/v1/responses", state, attempt, f"stall after {self.stall_timeout:.1f}s")
+                    self._trigger_recovery("/v1/responses", state, attempt, f"stall after {self.stall_timeout:.1f}s", session=session)
                 except aiohttp.ClientError as exc:
                     if _is_downstream_disconnect(req, exc, client_stream):
                         self.recovery_store.mark_interrupted(session, state, "client_disconnected")
                         log.info("   CLIENT CLOSED /v1/responses: %s", exc)
                         return response
                     log.warning("   CONN ERROR: %s", exc)
-                    self._trigger_recovery("/v1/responses", state, attempt, str(exc))
+                    self._trigger_recovery("/v1/responses", state, attempt, str(exc), session=session)
                 except OSError as exc:
                     if _is_downstream_disconnect(req, exc, client_stream):
                         self.recovery_store.mark_interrupted(session, state, "client_disconnected")
                         log.info("   CLIENT CLOSED /v1/responses: %s", exc)
                         return response
                     log.warning("   CONN ERROR: %s", exc)
-                    self._trigger_recovery("/v1/responses", state, attempt, str(exc))
+                    self._trigger_recovery("/v1/responses", state, attempt, str(exc), session=session)
                 except _UpstreamClientError as exc:
                     log.error("   CLIENT ERROR: %s", exc)
                     self.recovery_store.mark_interrupted(session, state, f"client_error: {exc}")
@@ -3921,7 +4152,7 @@ class ResilientProxy:
                         app_type="codex",
                     )
                     if not upstream:
-                        self._trigger_recovery("/v1/chat/completions", state, attempt, "no upstream is available")
+                        self._trigger_recovery("/v1/chat/completions", state, attempt, "no upstream is available", session=session)
                         attempt += 1
                         await asyncio.sleep(_retry_delay(attempt))
                         continue
@@ -3973,24 +4204,24 @@ class ResilientProxy:
                         return response
                 except _StreamTimeout as exc:
                     log.warning("   STALL: %s", exc)
-                    self._trigger_recovery("/v1/chat/completions", state, attempt, str(exc))
+                    self._trigger_recovery("/v1/chat/completions", state, attempt, str(exc), session=session)
                 except asyncio.TimeoutError:
                     log.warning("   STALL: %.1fs with no data", self.stall_timeout)
-                    self._trigger_recovery("/v1/chat/completions", state, attempt, f"stall after {self.stall_timeout:.1f}s")
+                    self._trigger_recovery("/v1/chat/completions", state, attempt, f"stall after {self.stall_timeout:.1f}s", session=session)
                 except aiohttp.ClientError as exc:
                     if _is_downstream_disconnect(req, exc, client_stream):
                         self.recovery_store.mark_interrupted(session, state, "client_disconnected")
                         log.info("   CLIENT CLOSED /v1/chat/completions: %s", exc)
                         return response
                     log.warning("   CONN ERROR: %s", exc)
-                    self._trigger_recovery("/v1/chat/completions", state, attempt, str(exc))
+                    self._trigger_recovery("/v1/chat/completions", state, attempt, str(exc), session=session)
                 except OSError as exc:
                     if _is_downstream_disconnect(req, exc, client_stream):
                         self.recovery_store.mark_interrupted(session, state, "client_disconnected")
                         log.info("   CLIENT CLOSED /v1/chat/completions: %s", exc)
                         return response
                     log.warning("   CONN ERROR: %s", exc)
-                    self._trigger_recovery("/v1/chat/completions", state, attempt, str(exc))
+                    self._trigger_recovery("/v1/chat/completions", state, attempt, str(exc), session=session)
                 except _UpstreamClientError as exc:
                     if _is_prefill_rejection(exc) and not prefill_disabled:
                         prefill_disabled = True
@@ -4727,6 +4958,7 @@ def run_watchdog(parent_pid: int, listen_port: int) -> int:
     proxy_url = f"http://{LOCAL_HOST}:{listen_port}"
     startup_deadline = time.monotonic() + WATCHDOG_STARTUP_GRACE
     unhealthy_since: float | None = None
+    degraded_grace_logged = False
     _append_watchdog_log(f"watchdog monitoring {proxy_url} for parent pid {parent_pid}")
 
     while True:
@@ -4736,6 +4968,7 @@ def run_watchdog(parent_pid: int, listen_port: int) -> int:
 
         if health_ok:
             unhealthy_since = None
+            degraded_grace_logged = False
         elif unhealthy_since is None:
             unhealthy_since = now
 
@@ -4749,10 +4982,22 @@ def run_watchdog(parent_pid: int, listen_port: int) -> int:
 
         if now >= startup_deadline and unhealthy_since is not None:
             unhealthy_for = now - unhealthy_since
-            if unhealthy_for >= WATCHDOG_FAILURE_GRACE:
+            failure_grace = _watchdog_failure_grace_for_port(listen_port)
+            if (
+                failure_grace > WATCHDOG_FAILURE_GRACE
+                and unhealthy_for >= WATCHDOG_FAILURE_GRACE
+                and not degraded_grace_logged
+            ):
+                _append_watchdog_log(
+                    f"proxy liveness unavailable for {unhealthy_for:.1f}s but port {listen_port} "
+                    f"is still open; extending watchdog grace to {failure_grace:.1f}s"
+                )
+                degraded_grace_logged = True
+
+            if unhealthy_for >= failure_grace:
                 restored_claude, restored_codex = _restore_fail_open_settings(listen_port)
                 _append_watchdog_log(
-                    f"proxy health unavailable for {unhealthy_for:.1f}s; restored fail-open settings "
+                    f"proxy liveness unavailable for {unhealthy_for:.1f}s; restored fail-open settings "
                     f"(claude={restored_claude}, codex={restored_codex})"
                 )
                 return 0
@@ -4788,6 +5033,12 @@ def build_arg_parser() -> argparse.ArgumentParser:
         default=1.0,
         help="settings.json poll interval in seconds",
     )
+    parser.add_argument("--aggressive-autoevolve", action="store_true", help=argparse.SUPPRESS)
+    parser.add_argument("--enable-supervisor", action="store_true", help=argparse.SUPPRESS)
+    parser.add_argument("--managed-by-supervisor", action="store_true", help=argparse.SUPPRESS)
+    parser.add_argument("--supervisor-pid", type=int, default=0, help=argparse.SUPPRESS)
+    parser.add_argument("--run-supervisor", action="store_true", help=argparse.SUPPRESS)
+    parser.add_argument("--supervisor-proxy-pid", type=int, default=0, help=argparse.SUPPRESS)
     parser.add_argument("--watchdog-parent-pid", type=int, default=0, help=argparse.SUPPRESS)
     parser.add_argument("--watchdog-listen-port", type=int, default=0, help=argparse.SUPPRESS)
     return parser
@@ -4812,10 +5063,621 @@ def _log_banner(settings_manager: SettingsManager, upstream: str, args: argparse
     log.info("=" * 58)
 
 
+def _build_proxy_cli_args(
+    args: argparse.Namespace,
+    *,
+    timeout_override: float | None = None,
+    managed_by_supervisor: bool = False,
+    supervisor_pid: int = 0,
+    enable_supervisor: bool = False,
+) -> list[str]:
+    cli_args = [
+        "--port",
+        str(args.port),
+        "--timeout",
+        str(args.timeout if timeout_override is None else timeout_override),
+        "--retries",
+        str(args.retries),
+        "--max-body-mb",
+        str(args.max_body_mb),
+        "--safe-resume-body-mb",
+        str(args.safe_resume_body_mb),
+        "--watch-interval",
+        str(args.watch_interval),
+    ]
+    if args.upstream:
+        cli_args.extend(["--upstream", args.upstream])
+    if getattr(args, "aggressive_autoevolve", False):
+        cli_args.append("--aggressive-autoevolve")
+    if enable_supervisor:
+        cli_args.append("--enable-supervisor")
+    if managed_by_supervisor:
+        cli_args.append("--managed-by-supervisor")
+    if supervisor_pid > 0:
+        cli_args.extend(["--supervisor-pid", str(supervisor_pid)])
+    return cli_args
+
+
+def _spawn_proxy_under_supervision(
+    args: argparse.Namespace,
+    *,
+    supervisor_pid: int,
+    timeout_override: float | None = None,
+) -> int | None:
+    try:
+        creationflags = 0
+        for flag_name in ("DETACHED_PROCESS", "CREATE_NEW_PROCESS_GROUP", "CREATE_NO_WINDOW"):
+            creationflags |= getattr(subprocess, flag_name, 0)
+
+        process = subprocess.Popen(
+            _self_launch_command(
+                *_build_proxy_cli_args(
+                    args,
+                    timeout_override=timeout_override,
+                    managed_by_supervisor=True,
+                    supervisor_pid=supervisor_pid,
+                )
+            ),
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            close_fds=True,
+            creationflags=creationflags,
+        )
+        return process.pid
+    except Exception as exc:
+        _append_supervisor_log(f"failed to spawn managed proxy: {exc}")
+        return None
+
+
+def _spawn_runtime_supervisor(parent_pid: int, args: argparse.Namespace) -> int | None:
+    state = _load_supervisor_state()
+    if isinstance(state, dict):
+        try:
+            existing_pid = int(state.get("pid") or 0)
+            existing_port = int(state.get("listen_port") or 0)
+        except Exception:
+            existing_pid = 0
+            existing_port = 0
+        if existing_port == args.port and existing_pid > 0 and _process_exists(existing_pid):
+            return existing_pid
+
+    try:
+        creationflags = 0
+        for flag_name in ("DETACHED_PROCESS", "CREATE_NEW_PROCESS_GROUP", "CREATE_NO_WINDOW"):
+            creationflags |= getattr(subprocess, flag_name, 0)
+
+        process = subprocess.Popen(
+            _self_launch_command(
+                "--run-supervisor",
+                * _build_proxy_cli_args(args),
+                "--supervisor-proxy-pid",
+                str(parent_pid),
+            ),
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            close_fds=True,
+            creationflags=creationflags,
+        )
+        return process.pid
+    except Exception as exc:
+        _append_supervisor_log(f"failed to start runtime supervisor: {exc}")
+        return None
+
+
+def _event_created_at_ms(event: dict[str, Any]) -> int:
+    try:
+        return int(event.get("created_at_ms") or 0)
+    except Exception:
+        return 0
+
+
+def _event_id(event: dict[str, Any]) -> str:
+    return str(event.get("id", "")).strip()
+
+
+def _event_failure_reason(event: dict[str, Any]) -> str:
+    meta = event.get("meta")
+    if isinstance(meta, dict):
+        reason = str(meta.get("reason", "")).strip()
+        if reason:
+            return reason
+    return str(event.get("detail", "")).strip()
+
+
+def _failure_reason_wants_more_time(reason: str) -> bool:
+    normalized = str(reason or "").lower()
+    return any(
+        token in normalized
+        for token in (
+            "timeout",
+            "stall",
+            "no data",
+            "first byte",
+            "visible output",
+            "tail fetch",
+        )
+    )
+
+
+def _health_failure_burst(events: Any, *, window_seconds: float) -> list[dict[str, Any]]:
+    if not isinstance(events, list):
+        return []
+
+    now_ms = int(time.time() * 1000)
+    earliest_ms = now_ms - int(window_seconds * 1000)
+    failures = [
+        dict(event)
+        for event in events
+        if isinstance(event, dict)
+        and str(event.get("kind", "")).strip() == "failed"
+        and _event_created_at_ms(event) >= earliest_ms
+    ]
+    failures.sort(key=_event_created_at_ms)
+    return failures
+
+
+def _disconnect_reason_wants_restart(reason: str) -> bool:
+    normalized = str(reason or "").lower()
+    return any(
+        token in normalized
+        for token in (
+            "http 502",
+            "http 503",
+            "bad response status code 502",
+            "bad response status code 503",
+            "proxy_error",
+            "connection failed",
+            "error sending request",
+            "connection reset",
+            "upstream",
+        )
+    )
+
+
+def _health_disconnect_burst(events: Any, *, window_seconds: float) -> list[dict[str, Any]]:
+    if not isinstance(events, list):
+        return []
+
+    now_ms = int(time.time() * 1000)
+    earliest_ms = now_ms - int(window_seconds * 1000)
+    disconnects = [
+        dict(event)
+        for event in events
+        if isinstance(event, dict)
+        and str(event.get("kind", "")).strip() == "disconnect"
+        and _event_created_at_ms(event) >= earliest_ms
+        and _disconnect_reason_wants_restart(_event_failure_reason(event))
+    ]
+    disconnects.sort(key=_event_created_at_ms)
+    return disconnects
+
+
+def _event_ids(events: list[dict[str, Any]]) -> list[str]:
+    ids = []
+    for event in events:
+        event_id = _event_id(event)
+        if event_id:
+            ids.append(event_id)
+    return ids
+
+
+def _propose_aggressive_policy(
+    *,
+    current_policy: dict[str, Any],
+    disconnect_burst: list[dict[str, Any]],
+    failure_burst: list[dict[str, Any]],
+    effective_timeout: float,
+) -> tuple[dict[str, Any] | None, str, list[str]]:
+    next_policy = dict(current_policy)
+    reason = ""
+    trigger_ids: list[str] = []
+
+    disconnect_threshold = max(
+        1,
+        _policy_int(
+            current_policy,
+            "disconnect_burst_threshold",
+            SUPERVISOR_DISCONNECT_BURST_THRESHOLD,
+        ),
+    )
+    disconnect_window = max(
+        10.0,
+        _policy_float(
+            current_policy,
+            "disconnect_window_seconds",
+            SUPERVISOR_DISCONNECT_WINDOW_SECONDS,
+        ),
+    )
+    failure_threshold = max(
+        1,
+        _policy_int(
+            current_policy,
+            "failure_burst_threshold",
+            SUPERVISOR_FAILURE_BURST_THRESHOLD,
+        ),
+    )
+    failure_window = max(
+        10.0,
+        _policy_float(
+            current_policy,
+            "failure_window_seconds",
+            SUPERVISOR_FAILURE_WINDOW_SECONDS,
+        ),
+    )
+    timeout_floor = max(
+        float(AGGRESSIVE_TIMEOUT_FLOOR),
+        _policy_float(current_policy, "timeout_floor", max(AGGRESSIVE_TIMEOUT_FLOOR, effective_timeout)),
+    )
+    restart_backoff = max(
+        0.5,
+        _policy_float(current_policy, "restart_backoff", SUPERVISOR_RESTART_BACKOFF),
+    )
+
+    if len(disconnect_burst) >= disconnect_threshold:
+        latest_reason = _event_failure_reason(disconnect_burst[-1])
+        target_timeout_floor = min(
+            SUPERVISOR_TIMEOUT_MAX,
+            max(timeout_floor, effective_timeout * SUPERVISOR_TIMEOUT_GROWTH, AGGRESSIVE_TIMEOUT_FLOOR),
+        )
+        next_policy.update(
+            {
+                "disconnect_burst_threshold": max(1, disconnect_threshold - 1),
+                "disconnect_window_seconds": min(300.0, disconnect_window + 30.0),
+                "timeout_floor": round(target_timeout_floor, 1),
+                "restart_backoff": max(0.5, restart_backoff - 0.5),
+            }
+        )
+        reason = f"disconnect burst autotune: {latest_reason}"
+        trigger_ids = _event_ids(disconnect_burst[-3:])
+    elif len(failure_burst) >= failure_threshold:
+        latest_reason = _event_failure_reason(failure_burst[-1])
+        target_timeout_floor = min(
+            SUPERVISOR_TIMEOUT_MAX,
+            max(timeout_floor, effective_timeout * SUPERVISOR_TIMEOUT_GROWTH),
+        )
+        next_policy.update(
+            {
+                "failure_burst_threshold": max(1, failure_threshold - 1),
+                "failure_window_seconds": min(300.0, failure_window + 60.0),
+                "timeout_floor": round(target_timeout_floor, 1),
+                "timeout_growth": round(
+                    min(
+                        2.0,
+                        _policy_float(current_policy, "timeout_growth", SUPERVISOR_TIMEOUT_GROWTH) + 0.1,
+                    ),
+                    2,
+                ),
+            }
+        )
+        reason = f"failure burst autotune: {latest_reason}"
+        trigger_ids = _event_ids(failure_burst[-3:])
+
+    if not reason or next_policy == current_policy:
+        return None, "", []
+    return next_policy, reason, trigger_ids
+
+
+def _maybe_evolve_aggressive_policy(
+    *,
+    enabled: bool,
+    disconnect_burst: list[dict[str, Any]],
+    failure_burst: list[dict[str, Any]],
+    effective_timeout: float,
+) -> dict[str, Any]:
+    if not enabled:
+        return {}
+
+    current_policy = _load_aggressive_policy()
+    state = _load_aggressive_state()
+    last_evolved_at = _policy_float(state, "last_evolved_at", 0.0)
+    now = time.time()
+    if now - last_evolved_at < AGGRESSIVE_EVOLVE_COOLDOWN_SECONDS:
+        return current_policy
+
+    proposed_policy, reason, trigger_ids = _propose_aggressive_policy(
+        current_policy=current_policy,
+        disconnect_burst=disconnect_burst,
+        failure_burst=failure_burst,
+        effective_timeout=effective_timeout,
+    )
+    if not proposed_policy:
+        return current_policy
+
+    signature = "|".join(trigger_ids)
+    if signature and signature == str(state.get("last_signature", "")).strip():
+        return current_policy
+
+    if _write_aggressive_policy(proposed_policy, reason=reason, trigger_ids=trigger_ids):
+        _write_aggressive_state(
+            {
+                "last_evolved_at": now,
+                "last_signature": signature,
+                "reason": reason,
+                "policy": proposed_policy,
+            }
+        )
+        _append_aggressive_log(f"applied aggressive policy update: {reason}")
+        return proposed_policy
+    return current_policy
+
+
+def run_supervisor(args: argparse.Namespace) -> int:
+    supervisor_pid = os.getpid()
+    current_proxy_pid = max(0, int(args.supervisor_proxy_pid or 0))
+    aggressive_enabled = bool(getattr(args, "aggressive_autoevolve", False))
+    effective_timeout = max(1.0, float(args.timeout))
+    last_timeout_tuned_at = 0.0
+    unhealthy_since: float | None = None
+    started_at = _timestamp_now()
+    incidents = IncidentHistory()
+    seen_failure_ids: set[str] = set()
+    seen_disconnect_ids: set[str] = set()
+    restart_count = 0
+    _append_supervisor_log(
+        f"supervisor started on port {args.port} for proxy pid {current_proxy_pid or '<unknown>'}"
+    )
+
+    try:
+        while True:
+            aggressive_policy = _load_aggressive_policy() if aggressive_enabled else {}
+            failure_window_seconds = _policy_float(
+                aggressive_policy,
+                "failure_window_seconds",
+                SUPERVISOR_FAILURE_WINDOW_SECONDS,
+            )
+            failure_burst_threshold = max(
+                1,
+                _policy_int(
+                    aggressive_policy,
+                    "failure_burst_threshold",
+                    SUPERVISOR_FAILURE_BURST_THRESHOLD,
+                ),
+            )
+            disconnect_window_seconds = _policy_float(
+                aggressive_policy,
+                "disconnect_window_seconds",
+                SUPERVISOR_DISCONNECT_WINDOW_SECONDS,
+            )
+            disconnect_burst_threshold = max(
+                1,
+                _policy_int(
+                    aggressive_policy,
+                    "disconnect_burst_threshold",
+                    SUPERVISOR_DISCONNECT_BURST_THRESHOLD,
+                ),
+            )
+            timeout_growth = _policy_float(
+                aggressive_policy,
+                "timeout_growth",
+                SUPERVISOR_TIMEOUT_GROWTH,
+            )
+            timeout_floor = _policy_float(
+                aggressive_policy,
+                "timeout_floor",
+                max(AGGRESSIVE_TIMEOUT_FLOOR, effective_timeout),
+            )
+            restart_backoff = _policy_float(
+                aggressive_policy,
+                "restart_backoff",
+                SUPERVISOR_RESTART_BACKOFF,
+            )
+            now = time.monotonic()
+            health_ok = _proxy_health_is_ok(args.port)
+            health = None
+            if health_ok:
+                with suppress(Exception):
+                    health = _request_local_json(args.port, "/health", timeout=1.0)
+
+            if isinstance(health, dict):
+                try:
+                    current_proxy_pid = int(health.get("pid") or current_proxy_pid or 0)
+                except Exception:
+                    current_proxy_pid = current_proxy_pid or 0
+
+            if health_ok:
+                unhealthy_since = None
+            elif unhealthy_since is None:
+                unhealthy_since = now
+
+            failure_burst = _health_failure_burst(
+                (health or {}).get("events") if isinstance(health, dict) else None,
+                window_seconds=failure_window_seconds,
+            )
+            new_failure_burst = [
+                event for event in failure_burst if _event_id(event) and _event_id(event) not in seen_failure_ids
+            ]
+            for event in new_failure_burst:
+                seen_failure_ids.add(_event_id(event))
+
+            disconnect_burst = _health_disconnect_burst(
+                (health or {}).get("events") if isinstance(health, dict) else None,
+                window_seconds=disconnect_window_seconds,
+            )
+            new_disconnect_burst = [
+                event
+                for event in disconnect_burst
+                if _event_id(event) and _event_id(event) not in seen_disconnect_ids
+            ]
+            for event in new_disconnect_burst:
+                seen_disconnect_ids.add(_event_id(event))
+
+            restart_reason = ""
+            restart_meta: dict[str, Any] = {
+                "listen_port": args.port,
+                "proxy_pid": current_proxy_pid,
+                "effective_timeout": effective_timeout,
+                "restart_count": restart_count,
+                "aggressive_policy": aggressive_policy if aggressive_policy else None,
+            }
+
+            aggressive_policy = _maybe_evolve_aggressive_policy(
+                enabled=aggressive_enabled,
+                disconnect_burst=disconnect_burst,
+                failure_burst=failure_burst,
+                effective_timeout=effective_timeout,
+            )
+            if aggressive_policy:
+                failure_window_seconds = _policy_float(
+                    aggressive_policy,
+                    "failure_window_seconds",
+                    failure_window_seconds,
+                )
+                failure_burst_threshold = max(
+                    1,
+                    _policy_int(
+                        aggressive_policy,
+                        "failure_burst_threshold",
+                        failure_burst_threshold,
+                    ),
+                )
+                disconnect_window_seconds = _policy_float(
+                    aggressive_policy,
+                    "disconnect_window_seconds",
+                    disconnect_window_seconds,
+                )
+                disconnect_burst_threshold = max(
+                    1,
+                    _policy_int(
+                        aggressive_policy,
+                        "disconnect_burst_threshold",
+                        disconnect_burst_threshold,
+                    ),
+                )
+                timeout_growth = _policy_float(
+                    aggressive_policy,
+                    "timeout_growth",
+                    timeout_growth,
+                )
+                timeout_floor = _policy_float(
+                    aggressive_policy,
+                    "timeout_floor",
+                    timeout_floor,
+                )
+                restart_backoff = _policy_float(
+                    aggressive_policy,
+                    "restart_backoff",
+                    restart_backoff,
+                )
+                restart_meta["aggressive_policy"] = aggressive_policy
+
+            if (
+                len(failure_burst) >= failure_burst_threshold
+                and new_failure_burst
+            ):
+                latest_failure = failure_burst[-1]
+                latest_reason = _event_failure_reason(latest_failure)
+                restart_reason = (
+                    f"{len(failure_burst)} failed recoveries within "
+                    f"{int(failure_window_seconds)}s"
+                )
+                restart_meta["latest_failure_reason"] = latest_reason
+                if latest_reason and _failure_reason_wants_more_time(latest_reason):
+                    previous_timeout = effective_timeout
+                    effective_timeout = min(
+                        SUPERVISOR_TIMEOUT_MAX,
+                        max(float(args.timeout), timeout_floor, effective_timeout * timeout_growth),
+                    )
+                    if effective_timeout > previous_timeout:
+                        last_timeout_tuned_at = now
+                        _append_supervisor_log(
+                            f"auto-tuned timeout from {previous_timeout:.1f}s to {effective_timeout:.1f}s "
+                            f"after repeated failures"
+                        )
+                        restart_meta["timeout_tuned_from"] = previous_timeout
+                        restart_meta["timeout_tuned_to"] = effective_timeout
+            elif (
+                len(disconnect_burst) >= disconnect_burst_threshold
+                and new_disconnect_burst
+            ):
+                latest_disconnect = disconnect_burst[-1]
+                latest_reason = _event_failure_reason(latest_disconnect)
+                restart_reason = (
+                    f"{len(disconnect_burst)} disconnects within "
+                    f"{int(disconnect_window_seconds)}s"
+                )
+                restart_meta["latest_disconnect_reason"] = latest_reason
+                effective_timeout = min(
+                    SUPERVISOR_TIMEOUT_MAX,
+                    max(float(args.timeout), timeout_floor, effective_timeout),
+                )
+            elif unhealthy_since is not None and now >= unhealthy_since + SUPERVISOR_STARTUP_GRACE:
+                unhealthy_for = now - unhealthy_since
+                if current_proxy_pid <= 0 or not _process_exists(current_proxy_pid):
+                    restart_reason = "managed proxy exited"
+                elif unhealthy_for >= SUPERVISOR_FAILURE_GRACE:
+                    restart_reason = f"proxy liveness unavailable for {unhealthy_for:.1f}s"
+                restart_meta["unhealthy_for_seconds"] = round(unhealthy_for, 1)
+
+            if restart_reason:
+                incidents.add("restart", restart_reason, meta=restart_meta)
+                _append_supervisor_log(f"{restart_reason}; launching replacement proxy")
+                new_pid = _spawn_proxy_under_supervision(
+                    args,
+                    supervisor_pid=supervisor_pid,
+                    timeout_override=effective_timeout,
+                )
+                if new_pid:
+                    restart_count += 1
+                    current_proxy_pid = new_pid
+                    unhealthy_since = None
+                    time.sleep(restart_backoff)
+                else:
+                    time.sleep(max(restart_backoff, 5.0))
+                _write_supervisor_state(
+                    {
+                        "pid": supervisor_pid,
+                        "listen_port": args.port,
+                        "proxy_pid": current_proxy_pid,
+                        "started_at": started_at,
+                        "status": "running",
+                        "restart_count": restart_count,
+                        "effective_timeout": effective_timeout,
+                        "aggressive_autoevolve": aggressive_enabled,
+                        "aggressive_policy": aggressive_policy if aggressive_policy else None,
+                    }
+                )
+                continue
+
+            if (
+                health_ok
+                and effective_timeout > float(args.timeout)
+                and last_timeout_tuned_at > 0
+                and now - last_timeout_tuned_at >= SUPERVISOR_TIMEOUT_DECAY_SECONDS
+            ):
+                previous_timeout = effective_timeout
+                effective_timeout = max(float(args.timeout), effective_timeout / SUPERVISOR_TIMEOUT_GROWTH)
+                last_timeout_tuned_at = now
+                if effective_timeout < previous_timeout:
+                    _append_supervisor_log(
+                        f"decayed timeout from {previous_timeout:.1f}s to {effective_timeout:.1f}s after stable uptime"
+                    )
+
+            _write_supervisor_state(
+                {
+                    "pid": supervisor_pid,
+                    "listen_port": args.port,
+                    "proxy_pid": current_proxy_pid,
+                    "started_at": started_at,
+                    "status": "running",
+                    "restart_count": restart_count,
+                    "effective_timeout": effective_timeout,
+                    "aggressive_autoevolve": aggressive_enabled,
+                    "aggressive_policy": aggressive_policy if aggressive_policy else None,
+                }
+            )
+            time.sleep(SUPERVISOR_POLL_INTERVAL)
+    finally:
+        _append_supervisor_log(f"supervisor exiting on port {args.port}")
+        _clear_supervisor_state(supervisor_pid)
+
+
 async def run_proxy(args: argparse.Namespace) -> int:
     stop_event = asyncio.Event()
     runner: web.AppRunner | None = None
     watchdog_pid: int | None = None
+    supervisor_pid: int | None = max(0, int(args.supervisor_pid or 0)) or None
 
     _take_over_existing_proxy_instance(args.port)
 
@@ -4880,8 +5742,10 @@ async def run_proxy(args: argparse.Namespace) -> int:
         args.retries,
         max_request_body_bytes=_mb_to_bytes(args.max_body_mb),
         safe_resume_body_bytes=_mb_to_bytes(args.safe_resume_body_mb),
+        supervisor_pid=supervisor_pid,
     )
     watchdog_pid = _spawn_safety_watchdog(os.getpid(), args.port)
+    watchdog_pid_holder[0] = watchdog_pid
     proxy.safety_watchdog_pid = watchdog_pid
 
     app = web.Application(
@@ -4893,6 +5757,7 @@ async def run_proxy(args: argparse.Namespace) -> int:
     app.router.add_post("/v1/messages", proxy.handle_messages)
     app.router.add_post("/v1/responses", proxy.handle_responses)
     app.router.add_post("/v1/chat/completions", proxy.handle_chat_completions)
+    app.router.add_get("/healthz", proxy.handle_healthz)
     app.router.add_get("/health", proxy.handle_health)
     app.router.add_post("/control/shutdown", proxy.handle_shutdown)
     app.router.add_route("*", "/{path:.*}", proxy.handle_catchall)
@@ -4926,6 +5791,9 @@ async def run_proxy(args: argparse.Namespace) -> int:
                 "upstream_source": settings_manager.current_upstream_source,
             },
         )
+        if args.enable_supervisor and not args.managed_by_supervisor:
+            supervisor_pid = _spawn_runtime_supervisor(os.getpid(), args)
+            proxy.supervisor_pid = supervisor_pid
         _log_banner(settings_manager, upstream, args)
         await stop_event.wait()
     finally:
@@ -4943,6 +5811,8 @@ async def run_proxy(args: argparse.Namespace) -> int:
 def main() -> None:
     parser = build_arg_parser()
     args = parser.parse_args()
+    if args.run_supervisor:
+        raise SystemExit(run_supervisor(args))
     if args.watchdog_parent_pid and args.watchdog_listen_port:
         raise SystemExit(run_watchdog(args.watchdog_parent_pid, args.watchdog_listen_port))
     raise SystemExit(asyncio.run(run_proxy(args)))

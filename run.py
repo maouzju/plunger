@@ -250,7 +250,7 @@ def main() -> None:
     from plunger_ui import build_arg_parser, main as ui_main
 
     args = build_arg_parser().parse_args()
-    _prelaunch_cleanup(args.port)
+    _clear_stale_gui_state(os.getpid())
     ui_main(args)
 
 
