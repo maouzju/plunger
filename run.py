@@ -20,6 +20,7 @@ from plunger_shared import CLAUDE_DIR, LOCAL_HOST, RECOVERY_DIR
 GUI_STATE_FILE = RECOVERY_DIR / "gui_state.json"
 PROXY_STATE_FILE = CLAUDE_DIR / ".plunger_state.json"
 CODEX_STATE_FILE = Path.home() / ".codex" / ".plunger_state.json"
+SUPERVISOR_STATE_FILE = RECOVERY_DIR / "supervisor_state.json"
 LOCAL_OPENER = build_opener(ProxyHandler({}))
 
 
@@ -75,14 +76,17 @@ def _request_local_json(
     return data if isinstance(data, dict) else None
 
 
-def _request_shutdown_for_port(port: int) -> int:
-    watchdog_pid = 0
+def _request_shutdown_for_port(port: int) -> set[int]:
+    related_pids: set[int] = set()
     with suppress(Exception):
         health = _request_local_json(port, "/health", timeout=0.8) or {}
-        watchdog_pid = _extract_positive_int(health.get("safety_watchdog_pid"))
+        for key in ("safety_watchdog_pid", "supervisor_pid"):
+            pid = _extract_positive_int(health.get(key))
+            if pid:
+                related_pids.add(pid)
     with suppress(Exception):
         _request_local_json(port, "/control/shutdown?mode=takeover", method="POST", timeout=1.2)
-    return watchdog_pid
+    return related_pids
 
 
 def _local_port_is_open(port: int) -> bool:
@@ -175,6 +179,7 @@ def _collect_state_pids() -> set[int]:
         for pid in (
             _read_state_pid(GUI_STATE_FILE),
             _read_state_pid(PROXY_STATE_FILE),
+            _read_state_pid(SUPERVISOR_STATE_FILE),
         )
         if pid
     }
@@ -190,6 +195,26 @@ def _scan_managed_process_pids(current_pid: int) -> set[int]:
     }
     pids.discard(0)
     return pids
+
+
+def _filter_managed_process_pids(candidate_pids: set[int], current_pid: int) -> set[int]:
+    normalized = {
+        _extract_positive_int(pid)
+        for pid in candidate_pids
+        if _extract_positive_int(pid) and _extract_positive_int(pid) != current_pid
+    }
+    if not normalized or os.name != "nt":
+        return normalized
+
+    markers = _managed_process_markers()
+    allowed = {
+        _extract_positive_int(process.get("ProcessId"))
+        for process in _snapshot_windows_processes()
+        if _extract_positive_int(process.get("ProcessId")) in normalized
+        and _is_managed_process(process, current_pid=current_pid, markers=markers)
+    }
+    allowed.discard(0)
+    return allowed
 
 
 def _terminate_pid_tree(pid: int, *, current_pid: int) -> None:
@@ -223,12 +248,11 @@ def _prelaunch_cleanup(listen_port: int) -> None:
     candidate_pids = _collect_state_pids()
 
     for port in ports:
-        watchdog_pid = _request_shutdown_for_port(port)
-        if watchdog_pid:
-            candidate_pids.add(watchdog_pid)
+        candidate_pids.update(_request_shutdown_for_port(port))
         _wait_for_port_release(port, timeout=1.5)
 
     candidate_pids.update(_scan_managed_process_pids(current_pid))
+    candidate_pids = _filter_managed_process_pids(candidate_pids, current_pid)
 
     for pid in sorted(candidate_pids):
         _terminate_pid_tree(pid, current_pid=current_pid)
@@ -239,11 +263,41 @@ def _prelaunch_cleanup(listen_port: int) -> None:
     _clear_stale_gui_state(current_pid)
 
 
+def _extract_listen_port(argv: list[str], default_port: int = 8462) -> int:
+    for index, arg in enumerate(argv):
+        if arg == "--port" and index + 1 < len(argv):
+            port = _extract_positive_int(argv[index + 1])
+            return port or default_port
+        if arg.startswith("--port="):
+            port = _extract_positive_int(arg.split("=", 1)[1])
+            return port or default_port
+    return default_port
+
+
+def _argv_has_flag(argv: list[str], flag: str) -> bool:
+    return flag in argv or any(arg.startswith(f"{flag}=") for arg in argv)
+
+
+def _should_prelaunch_cleanup(argv: list[str]) -> bool:
+    if "--headless" not in argv:
+        return False
+    if "--run-supervisor" in argv:
+        return False
+    if _argv_has_flag(argv, "--watchdog-parent-pid"):
+        return False
+    if "--managed-by-supervisor" in argv:
+        return False
+    return True
+
+
 def main() -> None:
     if "--headless" in sys.argv[1:]:
         from plunger import main as proxy_main
 
-        sys.argv = [sys.argv[0], *[arg for arg in sys.argv[1:] if arg != "--headless"]]
+        headless_args = sys.argv[1:]
+        if _should_prelaunch_cleanup(headless_args):
+            _prelaunch_cleanup(_extract_listen_port(headless_args))
+        sys.argv = [sys.argv[0], *[arg for arg in headless_args if arg != "--headless"]]
         proxy_main()
         return
 

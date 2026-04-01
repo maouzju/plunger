@@ -423,10 +423,13 @@ TRANSLATIONS: dict[str, dict[str, str]] = {
         "active_client_label": "\u8fde\u63a5\uff1a{client}",
         "active_hint_label": "\u63d0\u793a\uff1a{hint}",
         "active_hint_station_issue": "\u5df2\u91cd\u8bd5\u591a\u6b21\u4ecd\u672a\u8fde\u4e0a\uff0c\u8f83\u53ef\u80fd\u662f\u4e2d\u8f6c\u7ad9\u6216\u4e0a\u6e38\u901a\u9053\u6682\u65f6\u4e0d\u53ef\u7528\uff0c\u4e0d\u662f\u4f60\u5f53\u524d\u64cd\u4f5c\u5361\u4f4f\u4e86\u3002",
+        "active_hint_tool_timeout": "\u672c\u5730\u5de5\u5177\u7ed3\u679c\u7b49\u5f85\u8d85\u65f6\uff0c\u8f83\u53ef\u80fd\u662f\u5de5\u5177\u8c03\u7528\u6216 agent \u63a5\u529b\u94fe\u8def\u6ca1\u6709\u7eed\u4e0a\uff0c\u4e0d\u662f\u4e2d\u8f6c\u7ad9 503 \u65ad\u8fde\u3002",
         "active_reason_station_no_channel": "\u4e2d\u8f6c\u7ad9\u5f53\u524d\u6ca1\u6709\u53ef\u7528\u901a\u9053\uff0c\u6b63\u5728\u81ea\u52a8\u91cd\u8bd5\u3002",
         "active_reason_station_503": "\u4e2d\u8f6c\u7ad9\u6682\u65f6\u4e0d\u53ef\u7528\uff0c\u6b63\u5728\u81ea\u52a8\u91cd\u8bd5\u3002",
         "active_reason_station_502": "\u4e2d\u8f6c\u7ad9\u4e0e\u4e0a\u6e38\u8fde\u63a5\u5f02\u5e38\uff0c\u6b63\u5728\u81ea\u52a8\u91cd\u8bd5\u3002",
         "active_reason_station_timeout": "\u4e2d\u8f6c\u7ad9\u8fde\u63a5\u8d85\u65f6\uff0c\u6b63\u5728\u81ea\u52a8\u91cd\u8bd5\u3002",
+        "active_reason_waiting_tool": "\u5df2\u53d1\u51fa\u672c\u5730\u5de5\u5177\u8c03\u7528\uff0c\u6b63\u5728\u7b49\u5f85 tool_result \u56de\u6765\u3002",
+        "active_reason_tool_timeout": "\u672c\u5730\u5de5\u5177\u7ed3\u679c\u7b49\u5f85\u8d85\u65f6\uff0c\u4ee3\u7406\u8fd8\u6ca1\u6709\u7b49\u5230\u65b0\u7684 tool_result \u8bf7\u6c42\u3002",
         "active_reason_label": "\u6700\u8fd1\u5f02\u5e38\uff1a{reason}",
         "active_last_user_label": "\u6700\u8fd1\u8f93\u5165\uff1a{preview}",
         "active_partial_label": "\u6700\u8fd1\u8f93\u51fa\uff1a{preview}",
@@ -438,7 +441,7 @@ TRANSLATIONS: dict[str, dict[str, str]] = {
         "active_col_endpoint": "\u6807\u9898",
         "active_col_model": "\u6a21\u578b",
         "active_col_client": "\u8fde\u63a5",
-        "active_col_input": "\u6700\u8fd1\u8f93\u5165",
+        "active_col_input": "\u6982\u89c8",
         "active_status_running": "\u5904\u7406\u4e2d",
         "active_status_recovering": "\u91cd\u8bd5\u4e2d",
         "active_status_waiting_tool": "\u7b49\u5f85\u5de5\u5177",
@@ -570,10 +573,13 @@ TRANSLATIONS: dict[str, dict[str, str]] = {
         "active_client_label": "Connection: {client}",
         "active_hint_label": "Hint: {hint}",
         "active_hint_station_issue": "It has retried several times and still cannot connect. This is more likely a relay or upstream-channel issue, not your current action being stuck.",
+        "active_hint_tool_timeout": "Waiting for local tool results has timed out. This is more likely a tool-call or agent handoff issue, not a relay-side 503 disconnect.",
         "active_reason_station_no_channel": "The relay currently has no available channel and is retrying automatically.",
         "active_reason_station_503": "The relay is temporarily unavailable and is retrying automatically.",
         "active_reason_station_502": "The relay lost its upstream connection and is retrying automatically.",
         "active_reason_station_timeout": "The relay timed out while connecting and is retrying automatically.",
+        "active_reason_waiting_tool": "A local tool call was sent and the proxy is waiting for the next tool_result request.",
+        "active_reason_tool_timeout": "Waiting for local tool results has timed out and no new tool_result request has arrived yet.",
         "active_reason_label": "Latest error: {reason}",
         "active_last_user_label": "Latest input: {preview}",
         "active_partial_label": "Latest output: {preview}",
@@ -585,7 +591,7 @@ TRANSLATIONS: dict[str, dict[str, str]] = {
         "active_col_endpoint": "Title",
         "active_col_model": "Model",
         "active_col_client": "Connection",
-        "active_col_input": "Latest Input",
+        "active_col_input": "Overview",
         "active_status_running": "Running",
         "active_status_recovering": "Retrying",
         "active_status_waiting_tool": "Waiting Tool",
@@ -2350,16 +2356,21 @@ class ProxyDashboard:
             today_success, history_success = self._summarize_recovery_counts(events)
             self.stat_value_vars["today_success"].set(str(today_success))
             self.stat_value_vars["history_success"].set(str(history_success))
-            active_sessions = health.get("active_sessions")
-            if not isinstance(active_sessions, list):
-                active_sessions = [health.get("active_session")] if health.get("active_session") else []
-            pending_tool_waits = health.get("pending_tool_waits")
-            if not isinstance(pending_tool_waits, list):
-                pending_tool_waits = [health.get("pending_tool_wait")] if health.get("pending_tool_wait") else []
-            active_sessions.extend(
-                session for session in pending_tool_waits if isinstance(session, dict)
-            )
-            self._fill_active_sessions(active_sessions)
+            display_active_sessions = health.get("display_active_sessions")
+            if not isinstance(display_active_sessions, list):
+                display_active_sessions = [
+                    health.get("display_active_session")
+                ] if health.get("display_active_session") else []
+            if not display_active_sessions:
+                active_sessions = health.get("active_sessions")
+                if not isinstance(active_sessions, list):
+                    active_sessions = [health.get("active_session")] if health.get("active_session") else []
+                pending_tool_waits = health.get("pending_tool_waits")
+                if not isinstance(pending_tool_waits, list):
+                    pending_tool_waits = [health.get("pending_tool_wait")] if health.get("pending_tool_wait") else []
+                display_active_sessions = self._merge_active_sessions(active_sessions, pending_tool_waits)
+            merged_active_sessions = self._merge_active_sessions(display_active_sessions)
+            self._fill_active_sessions(merged_active_sessions)
             filtered_events = self._filter_events(
                 events,
                 started_at=str(health.get("started_at", "")).strip(),
@@ -2484,20 +2495,7 @@ class ProxyDashboard:
     def _fill_active_sessions(self, sessions: Any) -> None:
         self.active_tree.delete(*self.active_tree.get_children())
 
-        if not isinstance(sessions, list):
-            self.active_count_label.configure(text=self._t("active_none"))
-            return
-
-        normalized = [
-            session for session in sessions
-            if isinstance(session, dict)
-            and str(session.get("status", "")).strip() in {
-                "running",
-                "recovering",
-                "waiting_tool_result",
-                "tool_result_timeout",
-            }
-        ]
+        normalized = self._merge_active_sessions(sessions)
         if not normalized:
             self.active_count_label.configure(text=self._t("active_none"))
             return
@@ -2509,7 +2507,7 @@ class ProxyDashboard:
         for session in normalized:
             status_raw = str(session.get("status", "")).strip()
             reason = str(session.get("reason", "")).strip()
-            reason_display = self._humanize_recovery_reason(reason) if status_raw == "recovering" else reason
+            reason_display = self._humanize_active_status_reason(session)
             player_hint = self._active_session_player_hint(session, reason=reason)
             if status_raw == "recovering":
                 status_text = self._t("active_status_recovering")
@@ -2537,14 +2535,7 @@ class ProxyDashboard:
 
             model = str(session.get("model", "")).strip() or "-"
             client_label = str(session.get("client_label", "")).strip() or "-"
-
-            last_user_preview = str(session.get("last_user_text_preview", "")).strip()
-            input_display = (
-                player_hint
-                or (reason_display if status_raw == "recovering" and reason_display else "")
-                or last_user_preview
-                or "-"
-            )
+            input_display = self._active_session_overview_text(session)
 
             self.active_tree.insert(
                 "", "end",
@@ -2553,19 +2544,7 @@ class ProxyDashboard:
             )
 
     def _format_active_sessions(self, sessions: Any) -> str:
-        if not isinstance(sessions, list):
-            return self._t("active_none")
-
-        normalized = [
-            session for session in sessions
-            if isinstance(session, dict)
-            and str(session.get("status", "")).strip() in {
-                "running",
-                "recovering",
-                "waiting_tool_result",
-                "tool_result_timeout",
-            }
-        ]
+        normalized = self._merge_active_sessions(sessions)
         if not normalized:
             return self._t("active_none")
 
@@ -2614,11 +2593,81 @@ class ProxyDashboard:
             return self._t("active_reason_station_timeout")
         return normalized
 
+    def _humanize_active_status_reason(self, session: Any) -> str:
+        if not isinstance(session, dict):
+            return ""
+
+        status = str(session.get("status", "")).strip()
+        if status == "recovering":
+            return self._humanize_recovery_reason(str(session.get("reason", "")).strip())
+        if status == "tool_result_timeout":
+            return self._t("active_reason_tool_timeout")
+        if status == "waiting_tool_result":
+            return self._t("active_reason_waiting_tool")
+        return str(session.get("reason", "")).strip()
+
+    def _merge_active_sessions(self, sessions: Any, pending_tool_waits: Any = None) -> list[dict[str, Any]]:
+        def _coerce_items(value: Any, fallback_item: Any = None) -> list[dict[str, Any]]:
+            items = value
+            if not isinstance(items, list):
+                items = [fallback_item] if isinstance(fallback_item, dict) else []
+            return [dict(item) for item in items if isinstance(item, dict)]
+
+        active_items = _coerce_items(
+            sessions,
+            sessions if isinstance(sessions, dict) else None,
+        )
+        pending_items = _coerce_items(
+            pending_tool_waits,
+            pending_tool_waits if isinstance(pending_tool_waits, dict) else None,
+        )
+
+        def _session_key(item: dict[str, Any]) -> str:
+            session_id = str(item.get("session_id", "")).strip()
+            if session_id:
+                return session_id
+            return "|".join(
+                [
+                    str(item.get("endpoint", "")).strip(),
+                    str(item.get("response_id", "")).strip(),
+                    str(item.get("message_id", "")).strip(),
+                    str(item.get("started_at", "")).strip(),
+                    str(item.get("request_summary", "")).strip(),
+                ]
+            )
+
+        merged: dict[str, dict[str, Any]] = {}
+        for session in active_items:
+            merged[_session_key(session)] = session
+        for pending in pending_items:
+            key = _session_key(pending)
+            existing = merged.get(key)
+            if existing is None:
+                merged[key] = pending
+            else:
+                merged[key] = {**existing, **pending}
+
+        normalized = [
+            session
+            for session in merged.values()
+            if str(session.get("status", "")).strip() in {
+                "running",
+                "recovering",
+                "waiting_tool_result",
+                "tool_result_timeout",
+            }
+        ]
+        normalized.sort(key=lambda item: str(item.get("updated_at", "")), reverse=True)
+        return normalized
+
     def _active_session_player_hint(self, session: Any, *, reason: str = "") -> str:
         if not isinstance(session, dict):
             return ""
 
-        if str(session.get("status", "")).strip() != "recovering":
+        status = str(session.get("status", "")).strip()
+        if status == "tool_result_timeout":
+            return self._t("active_hint_tool_timeout")
+        if status != "recovering":
             return ""
 
         try:
@@ -2647,6 +2696,23 @@ class ProxyDashboard:
         if any(marker in normalized_reason for marker in issue_markers):
             return self._t("active_hint_station_issue")
         return ""
+
+    def _active_session_overview_text(self, session: Any) -> str:
+        if not isinstance(session, dict):
+            return "-"
+
+        status = str(session.get("status", "")).strip()
+        reason_display = self._humanize_active_status_reason(session)
+        player_hint = self._active_session_player_hint(
+            session,
+            reason=str(session.get("reason", "")).strip(),
+        )
+        if player_hint:
+            return player_hint
+        if status in {"recovering", "waiting_tool_result", "tool_result_timeout"} and reason_display:
+            return reason_display
+        last_user_preview = str(session.get("last_user_text_preview", "")).strip()
+        return last_user_preview or "-"
 
     def _format_active_session(self, session: Any) -> str:
         if not isinstance(session, dict):
@@ -2687,7 +2753,7 @@ class ProxyDashboard:
         except (TypeError, ValueError):
             recovery_attempt = 0
         reason = str(session.get("reason", "")).strip()
-        reason_display = self._humanize_recovery_reason(reason) if status == "recovering" else reason
+        reason_display = self._humanize_active_status_reason(session)
         player_hint = self._active_session_player_hint(session, reason=reason)
 
         if status == "recovering":

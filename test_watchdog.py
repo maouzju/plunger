@@ -314,6 +314,87 @@ def test_run_supervisor_restarts_after_disconnect_burst(monkeypatch) -> None:
     assert spawns == [(9002, 75.0)]
 
 
+def test_run_supervisor_does_not_restart_for_tool_wait_timeout_burst(monkeypatch) -> None:
+    incidents: list[tuple[str, str, dict[str, object] | None]] = []
+    spawns: list[tuple[int, float | None]] = []
+
+    class _StubIncidents:
+        def add(self, kind: str, reason: str, *, meta=None):
+            incidents.append((kind, reason, meta))
+            return {"kind": kind, "reason": reason}
+
+    class _StopLoop(RuntimeError):
+        pass
+
+    args = Namespace(
+        port=8462,
+        timeout=60.0,
+        retries=-1,
+        max_body_mb=32.0,
+        safe_resume_body_mb=19.0,
+        watch_interval=1.0,
+        upstream=None,
+        supervisor_proxy_pid=321,
+    )
+
+    monkeypatch.setattr(plunger.os, "getpid", lambda: 9003)
+    monkeypatch.setattr(plunger, "IncidentHistory", _StubIncidents)
+    monkeypatch.setattr(plunger, "_append_supervisor_log", lambda message: None)
+    monkeypatch.setattr(plunger, "_write_supervisor_state", lambda payload: None)
+    monkeypatch.setattr(plunger, "_clear_supervisor_state", lambda expected_pid=None: None)
+    monkeypatch.setattr(plunger, "_proxy_health_is_ok", lambda port: True)
+    monkeypatch.setattr(
+        plunger,
+        "_request_local_json",
+        lambda port, path, timeout=1.0, method="GET": {
+            "pid": 321,
+            "events": [
+                {
+                    "id": "t1",
+                    "kind": "tool_wait_timeout",
+                    "created_at_ms": 195_000,
+                    "meta": {"wait_seconds": 30, "tool_names": ["shell_command"]},
+                },
+                {
+                    "id": "t2",
+                    "kind": "tool_wait_timeout",
+                    "created_at_ms": 196_000,
+                    "meta": {"wait_seconds": 31, "tool_names": ["shell_command"]},
+                },
+                {
+                    "id": "t3",
+                    "kind": "tool_wait_timeout",
+                    "created_at_ms": 197_000,
+                    "meta": {"wait_seconds": 35, "tool_names": ["apply_patch"]},
+                },
+            ],
+        },
+    )
+    monkeypatch.setattr(plunger.time, "time", lambda: 200.0)
+    monkeypatch.setattr(plunger.time, "monotonic", lambda: 500.0)
+    monkeypatch.setattr(
+        plunger,
+        "_spawn_proxy_under_supervision",
+        lambda ns, *, supervisor_pid, timeout_override=None: spawns.append(
+            (supervisor_pid, timeout_override)
+        )
+        or 656,
+    )
+    monkeypatch.setattr(
+        plunger.time,
+        "sleep",
+        lambda seconds: (_ for _ in ()).throw(_StopLoop()),
+    )
+
+    try:
+        plunger.run_supervisor(args)
+    except _StopLoop:
+        pass
+
+    assert incidents == []
+    assert spawns == []
+
+
 def test_trigger_recovery_updates_active_session_snapshot_immediately(
     tmp_path,
     monkeypatch,

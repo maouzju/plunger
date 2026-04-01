@@ -162,6 +162,62 @@ def test_responses_tool_result_falls_back_to_oldest_without_response_id_match() 
     assert "newer" in proxy.pending_tool_waits
 
 
+def test_build_health_payload_prefers_pending_tool_wait_status(monkeypatch) -> None:
+    proxy = _make_proxy()
+    proxy.recovery_store = type(
+        "RecoveryStub",
+        (),
+        {
+            "active_sessions_snapshot": lambda self: [
+                {
+                    "session_id": "session-1",
+                    "endpoint": "/v1/responses",
+                    "endpoint_label": "responses",
+                    "model": "gpt-5.4",
+                    "upstream": "http://127.0.0.1:15721",
+                    "started_at": "2026-03-30 11:27:23",
+                    "updated_at": "2026-03-30 11:27:24",
+                    "status": "running",
+                    "request_summary": "permissions instructions",
+                    "client_label": "127.0.0.1:52031",
+                }
+            ],
+            "load_last_interrupted": lambda self, endpoint=None: None,
+        },
+    )()
+    proxy.pending_tool_waits = {
+        "session-1": {
+            "session_id": "session-1",
+            "endpoint": "/v1/responses",
+            "endpoint_label": "responses",
+            "model": "gpt-5.4",
+            "started_at": "2026-03-30 11:27:23",
+            "updated_at": "2026-03-30 11:27:52",
+            "status": "tool_result_timeout",
+            "request_summary": "permissions instructions",
+            "client_label": "127.0.0.1:52031",
+            "tool_names": ["shell_command"],
+            "tool_count": 1,
+            "_wait_started_at_ts": 120.0,
+            "_timed_out": True,
+        }
+    }
+
+    monkeypatch.setattr(rp.time, "time", lambda: 200.0)
+
+    payload = proxy._build_health_payload()
+
+    assert payload["active_sessions_count"] == 1
+    assert payload["active_session"]["status"] == "running"
+    assert payload["active_session"]["upstream"] == "http://127.0.0.1:15721"
+    assert payload["display_active_sessions_count"] == 1
+    assert payload["display_active_session"]["status"] == "tool_result_timeout"
+    assert payload["display_active_session"]["tool_names"] == ["shell_command"]
+    assert payload["display_active_session"]["wait_seconds"] == 80
+    assert payload["display_active_session"]["upstream"] == "http://127.0.0.1:15721"
+    assert payload["pending_tool_waits_count"] == 1
+
+
 def test_messages_continue_repairs_dangling_tool_use() -> None:
     proxy = _make_proxy()
     proxy.recovery_store = type(

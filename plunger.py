@@ -2732,6 +2732,46 @@ class ResilientProxy:
         items.sort(key=lambda item: str(item.get("updated_at", "")), reverse=True)
         return items
 
+    def _display_active_sessions_snapshot(self) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+        active_sessions = self.recovery_store.active_sessions_snapshot()
+        pending_tool_waits = self._pending_tool_waits_snapshot()
+
+        def _session_key(item: Any) -> str:
+            if not isinstance(item, dict):
+                return ""
+            session_id = str(item.get("session_id", "")).strip()
+            if session_id:
+                return session_id
+            return "|".join(
+                [
+                    str(item.get("endpoint", "")).strip(),
+                    str(item.get("response_id", "")).strip(),
+                    str(item.get("message_id", "")).strip(),
+                    str(item.get("started_at", "")).strip(),
+                    str(item.get("request_summary", "")).strip(),
+                ]
+            )
+
+        merged: dict[str, dict[str, Any]] = {}
+        for session in active_sessions:
+            if not isinstance(session, dict):
+                continue
+            merged[_session_key(session)] = dict(session)
+
+        for pending in pending_tool_waits:
+            if not isinstance(pending, dict):
+                continue
+            key = _session_key(pending)
+            existing = merged.get(key)
+            if existing is None:
+                merged[key] = dict(pending)
+            else:
+                merged[key] = {**existing, **pending}
+
+        display_sessions = list(merged.values())
+        display_sessions.sort(key=lambda item: str(item.get("updated_at", "")), reverse=True)
+        return display_sessions, pending_tool_waits
+
     def _resolve_attempt_target(
         self,
         endpoint: str,
@@ -2931,7 +2971,7 @@ class ResilientProxy:
 
     def _build_health_payload(self) -> dict[str, Any]:
         active_sessions = self.recovery_store.active_sessions_snapshot()
-        pending_tool_waits = self._pending_tool_waits_snapshot()
+        display_active_sessions, pending_tool_waits = self._display_active_sessions_snapshot()
         last_interrupted = self._summarize_saved_session(
             self.recovery_store.load_last_interrupted()
         )
@@ -2958,6 +2998,9 @@ class ResilientProxy:
             "active_session": active_sessions[0] if active_sessions else None,
             "active_sessions": active_sessions,
             "active_sessions_count": len(active_sessions),
+            "display_active_session": display_active_sessions[0] if display_active_sessions else None,
+            "display_active_sessions": display_active_sessions,
+            "display_active_sessions_count": len(display_active_sessions),
             "pending_tool_wait": pending_tool_waits[0] if pending_tool_waits else None,
             "pending_tool_waits": pending_tool_waits,
             "pending_tool_waits_count": len(pending_tool_waits),
