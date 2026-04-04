@@ -6,6 +6,8 @@ __pycache__/
 # PyInstaller build artifacts
 build/
 dist/
+build_live_*/
+dist_live_*/
 *.spec
 
 # Runtime logs

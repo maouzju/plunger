@@ -23,6 +23,71 @@ def test_responses_tail_fetch_timeout_uses_bounded_window() -> None:
     assert fast_proxy._responses_tail_fetch_timeout() == 12.0
 
 
+def test_persistent_stats_survive_proxy_restart(tmp_path, monkeypatch) -> None:
+    monkeypatch.setattr(rp, "STATS_FILE", tmp_path / "stats.json")
+
+    proxy = _make_proxy()
+    proxy._increment_stat("total")
+    proxy._increment_stat("total")
+    proxy._increment_stat("recoveries_triggered")
+    proxy._increment_stat("success")
+    proxy.persistent_stats.flush(force=True)
+
+    payload = proxy._build_health_payload()
+    assert payload["total"] == 2
+    assert payload["current_run_stats"]["total"] == 2
+    assert payload["current_run_recovery_summary"] == {"triggers": 0, "success": 0}
+    assert payload["lifetime_total"] == 2
+    assert payload["lifetime_recoveries_triggered"] == 1
+    assert payload["lifetime_success"] == 1
+
+    restarted_proxy = _make_proxy()
+    restarted_payload = restarted_proxy._build_health_payload()
+    assert restarted_payload["total"] == 0
+    assert restarted_payload["current_run_stats"]["total"] == 0
+    assert restarted_payload["current_run_recovery_summary"] == {"triggers": 0, "success": 0}
+    assert restarted_payload["lifetime_total"] == 2
+    assert restarted_payload["lifetime_recoveries_triggered"] == 1
+    assert restarted_payload["lifetime_success"] == 1
+
+
+def test_persistent_stats_batch_disk_writes(monkeypatch, tmp_path) -> None:
+    writes: list[dict[str, object]] = []
+
+    monkeypatch.setattr(
+        rp,
+        "_write_json",
+        lambda path, payload: writes.append(dict(payload)),
+    )
+
+    stats = rp.PersistentStats(
+        tmp_path / "stats.json",
+        persist_interval_seconds=60.0,
+        max_pending_updates=10,
+    )
+    stats.add("total")
+    stats.add("success")
+
+    assert writes == []
+
+    stats.flush(force=True)
+
+    assert len(writes) == 1
+    assert writes[0]["total"] == 1
+    assert writes[0]["success"] == 1
+
+
+def test_recovery_outcome_tracker_uses_root_session_ids() -> None:
+    tracker = rp.RecoveryOutcomeTracker()
+
+    tracker.record("root-a", "disconnect")
+    tracker.record("root-a", "recovered")
+    tracker.record("root-b", "disconnect")
+    tracker.record("root-b", "failed")
+
+    assert tracker.summary() == {"triggers": 2, "success": 1}
+
+
 def test_handle_shutdown_takeover_marks_cleanup_to_skip_restore() -> None:
     proxy = _make_proxy()
     recorded_events: list[tuple[tuple[object, ...], dict[str, object]]] = []

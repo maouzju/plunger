@@ -125,6 +125,7 @@ STATE_FILE = CLAUDE_DIR / ".plunger_state.json"
 LAST_INTERRUPTED_FILE = RECOVERY_DIR / "last_interrupted.json"
 ACTIVE_SESSIONS_FILE = RECOVERY_DIR / "active_sessions.json"
 EVENT_HISTORY_FILE = RECOVERY_DIR / "events.json"
+STATS_FILE = RECOVERY_DIR / "stats.json"
 WATCHDOG_LOG_FILE = RECOVERY_DIR / "watchdog.log"
 SERVICE_LOG_FILE = RECOVERY_DIR / "service.log"
 SUPERVISOR_LOG_FILE = RECOVERY_DIR / "supervisor.log"
@@ -177,6 +178,28 @@ CONTINUE_PATTERNS = (
     "往下",
     "往后",
 )
+
+STAT_KEYS = (
+    "total",
+    "success",
+    "recoveries_triggered",
+    "recoveries_succeeded",
+    "retry_attempts",
+)
+STATS_PERSIST_INTERVAL_SECONDS = 5.0
+STATS_PERSIST_MAX_PENDING_UPDATES = 100
+
+
+def _coerce_non_negative_int(value: Any) -> int:
+    try:
+        number = int(value)
+    except (TypeError, ValueError):
+        return 0
+    return number if number > 0 else 0
+
+
+def _empty_stats_snapshot() -> dict[str, int]:
+    return {key: 0 for key in STAT_KEYS}
 
 
 REQUEST_TITLE_HEADER_NAMES = (
@@ -1462,9 +1485,16 @@ class RecoveryStore:
         request_summary = _build_request_title(request_title, first_user_text, last_user_text)
         if not request_summary:
             request_summary = _clean_request_title(f"{method.upper()} {endpoint}", limit=80)
+        continued_from_session_id = str((continued_from or {}).get("session_id", "")).strip()
+        root_session_id = str(
+            (continued_from or {}).get("root_session_id", "")
+            or continued_from_session_id
+            or session_id
+        ).strip()
 
         payload = {
             "session_id": session_id,
+            "root_session_id": root_session_id,
             "endpoint": endpoint,
             "model": payload.get("model", ""),
             "upstream": upstream,
@@ -1474,7 +1504,7 @@ class RecoveryStore:
             "request_body": deepcopy(payload) if payload else None,
             "request_method": method.upper(),
             "status": "running",
-            "continued_from_session_id": (continued_from or {}).get("session_id", ""),
+            "continued_from_session_id": continued_from_session_id,
             "client_label": client_label,
             "_last_saved_len": 0,
             "_last_saved_at": 0.0,
@@ -1499,6 +1529,7 @@ class RecoveryStore:
 
         payload = {
             "session_id": session["session_id"],
+            "root_session_id": session.get("root_session_id", session["session_id"]),
             "endpoint": session["endpoint"],
             "model": session.get("model", ""),
             "upstream": session.get("upstream", ""),
@@ -1592,6 +1623,7 @@ class RecoveryStore:
 
         payload = {
             "session_id": session_id,
+            "root_session_id": session.get("root_session_id", session_id),
             "endpoint": session.get("endpoint", ""),
             "endpoint_label": _endpoint_label(str(session.get("endpoint", ""))),
             "model": session.get("model", ""),
@@ -1698,6 +1730,105 @@ class EventHistory:
             )
         except Exception as exc:
             log.warning("Failed to persist event history: %s", exc)
+
+
+class RecoveryOutcomeTracker:
+    def __init__(self) -> None:
+        self.chains: dict[str, list[dict[str, Any]]] = {}
+
+    def record(self, chain_id: str, kind: str) -> None:
+        chain_id = str(chain_id).strip()
+        if not chain_id:
+            return
+        history = self.chains.setdefault(chain_id, [])
+        if kind == "disconnect" or not history:
+            history.append(
+                {
+                    "has_disconnect": kind == "disconnect",
+                    "latest_kind": kind,
+                }
+            )
+            return
+
+        history[-1]["latest_kind"] = kind
+
+    def summary(self) -> dict[str, int]:
+        trigger_count = 0
+        success_count = 0
+        for history in self.chains.values():
+            for chain in history:
+                if chain.get("has_disconnect"):
+                    trigger_count += 1
+                if chain.get("latest_kind") == "recovered":
+                    success_count += 1
+        return {
+            "triggers": trigger_count,
+            "success": success_count,
+        }
+
+
+class PersistentStats:
+    def __init__(
+        self,
+        path: Path | None = None,
+        *,
+        persist_interval_seconds: float = STATS_PERSIST_INTERVAL_SECONDS,
+        max_pending_updates: int = STATS_PERSIST_MAX_PENDING_UPDATES,
+    ) -> None:
+        self.path = path or STATS_FILE
+        self.stats = self._load()
+        self.persist_interval_seconds = max(0.0, float(persist_interval_seconds))
+        self.max_pending_updates = max(1, int(max_pending_updates))
+        self._dirty = False
+        self._pending_updates = 0
+        self._last_persist_monotonic = time.monotonic()
+
+    def add(self, key: str, amount: int = 1) -> None:
+        if key not in STAT_KEYS or amount == 0:
+            return
+        self.stats[key] = _coerce_non_negative_int(self.stats.get(key)) + int(amount)
+        self._dirty = True
+        self._pending_updates += 1
+        self.flush()
+
+    def snapshot(self) -> dict[str, int]:
+        return dict(self.stats)
+
+    def flush(self, *, force: bool = False) -> None:
+        if not self._dirty:
+            return
+        now = time.monotonic()
+        if not force:
+            if self._pending_updates < self.max_pending_updates and (
+                now - self._last_persist_monotonic
+            ) < self.persist_interval_seconds:
+                return
+        if not self._persist():
+            return
+        self._dirty = False
+        self._pending_updates = 0
+        self._last_persist_monotonic = now
+
+    def _load(self) -> dict[str, int]:
+        payload = _read_json_file(self.path) or {}
+        stats = _empty_stats_snapshot()
+        for key in STAT_KEYS:
+            stats[key] = _coerce_non_negative_int(payload.get(key))
+        return stats
+
+    def _persist(self) -> bool:
+        try:
+            _write_json(
+                self.path,
+                {
+                    "updated_at": _timestamp_now(),
+                    **self.stats,
+                },
+            )
+            return True
+        except Exception as exc:
+            log.warning("Failed to persist stats snapshot: %s", exc)
+            return False
 
 
 class IncidentHistory:
@@ -2308,6 +2439,9 @@ class StreamState:
     accumulated_text: str = ""
     bytes_forwarded: int = 0
     is_first_attempt: bool = True
+    session_id: str = ""
+    root_session_id: str = ""
+    continued_from_session_id: str = ""
     message_id: str = ""
     response_id: str = ""
     response_item_id: str = ""
@@ -2468,16 +2602,50 @@ class ResilientProxy:
         self.tool_wait_timeout = max(10.0, min(DEFAULT_TOOL_WAIT_TIMEOUT, stall_timeout))
         self.recovery_store = RecoveryStore()
         self.event_history = EventHistory()
+        self.recovery_outcomes = RecoveryOutcomeTracker()
+        self.persistent_stats = PersistentStats()
         self.pending_tool_waits: dict[str, dict[str, Any]] = {}
-        self.stats = {
-            "total": 0,
-            "success": 0,
-            "recoveries_triggered": 0,
-            "recoveries_succeeded": 0,
-            "retry_attempts": 0,
-        }
+        self.stats = _empty_stats_snapshot()
         self.started_at_ms = int(time.time() * 1000)
         self.started_at = _timestamp_now()
+
+    def _bind_session_identity(self, state: StreamState, session: dict[str, Any]) -> None:
+        state.request_summary = str(session.get("request_summary", "")).strip()
+        state.session_id = str(session.get("session_id", "")).strip()
+        state.root_session_id = str(
+            session.get("root_session_id") or state.session_id
+        ).strip()
+        state.continued_from_session_id = str(
+            session.get("continued_from_session_id", "")
+        ).strip()
+
+    def _recovery_chain_key(self, state: StreamState) -> str:
+        return (
+            state.root_session_id
+            or state.session_id
+            or state.continued_from_session_id
+            or state.request_summary
+        )
+
+    def _recovery_chain_meta(self, state: StreamState) -> dict[str, Any]:
+        meta = {
+            "request_summary": state.request_summary,
+        }
+        if state.session_id:
+            meta["session_id"] = state.session_id
+        if state.root_session_id:
+            meta["root_session_id"] = state.root_session_id
+        if state.continued_from_session_id:
+            meta["continued_from_session_id"] = state.continued_from_session_id
+        return meta
+
+    def _increment_stat(self, key: str, amount: int = 1) -> None:
+        if key not in STAT_KEYS or amount == 0:
+            return
+        self.stats[key] = _coerce_non_negative_int(self.stats.get(key)) + int(amount)
+        store = getattr(self, "persistent_stats", None)
+        if store is not None:
+            store.add(key, amount)
 
     def _should_retry(self, attempt: int) -> bool:
         return self.max_retries < 0 or attempt < self.max_retries
@@ -2786,7 +2954,7 @@ class ResilientProxy:
         return upstream, attempt_headers, attempt_route
 
     async def handle_messages(self, req: web.Request) -> web.StreamResponse:
-        self.stats["total"] += 1
+        self._increment_stat("total")
 
         upstream = self.settings_manager.current_upstream
         if not upstream:
@@ -2835,7 +3003,7 @@ class ResilientProxy:
         return await self._resilient_messages(req, body, headers, resumed)
 
     async def handle_responses(self, req: web.Request) -> web.StreamResponse:
-        self.stats["total"] += 1
+        self._increment_stat("total")
 
         upstream = self.settings_manager.current_upstream
         if not upstream:
@@ -2872,7 +3040,7 @@ class ResilientProxy:
         return await self._resilient_responses(req, body, headers, resumed)
 
     async def handle_chat_completions(self, req: web.Request) -> web.StreamResponse:
-        self.stats["total"] += 1
+        self._increment_stat("total")
 
         upstream = self.settings_manager.current_upstream
         if not upstream:
@@ -2925,6 +3093,9 @@ class ResilientProxy:
         if skip_restore and isinstance(cleanup_state, dict):
             cleanup_state["skip_restore"] = True
             cleanup_state["reason"] = shutdown_mode
+        store = getattr(self, "persistent_stats", None)
+        if store is not None:
+            store.flush(force=True)
 
         self.event_history.add(
             "service_takeover" if skip_restore else "service_stop",
@@ -2975,6 +3146,11 @@ class ResilientProxy:
         last_interrupted = self._summarize_saved_session(
             self.recovery_store.load_last_interrupted()
         )
+        lifetime_stats = dict(self.stats)
+        store = getattr(self, "persistent_stats", None)
+        if store is not None:
+            lifetime_stats = store.snapshot()
+        current_run_recovery_summary = self.recovery_outcomes.summary()
         return {
             "status": "ok",
             "listen": self.settings_manager.proxy_url,
@@ -3006,6 +3182,14 @@ class ResilientProxy:
             "pending_tool_waits_count": len(pending_tool_waits),
             "last_interrupted": last_interrupted,
             "events": self.event_history.snapshot(),
+            "current_run_stats": dict(self.stats),
+            "current_run_recovery_summary": current_run_recovery_summary,
+            "lifetime_stats": lifetime_stats,
+            "lifetime_total": lifetime_stats.get("total", 0),
+            "lifetime_success": lifetime_stats.get("success", 0),
+            "lifetime_recoveries_triggered": lifetime_stats.get("recoveries_triggered", 0),
+            "lifetime_recoveries_succeeded": lifetime_stats.get("recoveries_succeeded", 0),
+            "lifetime_retry_attempts": lifetime_stats.get("retry_attempts", 0),
             **self.stats,
         }
 
@@ -3016,9 +3200,18 @@ class ResilientProxy:
         attempt: int,
         reason: str,
     ) -> None:
+        self.recovery_outcomes.record(self._recovery_chain_key(state), "disconnect")
         detail = f"{_endpoint_label(endpoint)} | attempt {attempt + 1} | {_shorten_text(reason, 96)}"
         if state.accumulated_text:
             detail += f" | buffered {len(state.accumulated_text)} chars"
+        meta = self._recovery_chain_meta(state)
+        meta.update(
+            {
+                "attempt": attempt + 1,
+                "buffered_chars": len(state.accumulated_text),
+                "reason": reason,
+            }
+        )
         self.event_history.add(
             "disconnect",
             "Stream interrupted",
@@ -3026,12 +3219,7 @@ class ResilientProxy:
             endpoint=endpoint,
             model=state.model,
             tone="warning",
-            meta={
-                "attempt": attempt + 1,
-                "buffered_chars": len(state.accumulated_text),
-                "reason": reason,
-                "request_summary": state.request_summary,
-            },
+            meta=meta,
         )
 
     def _trigger_recovery(
@@ -3051,7 +3239,7 @@ class ResilientProxy:
         if state.recovery_triggered:
             return
         state.recovery_triggered = True
-        self.stats["recoveries_triggered"] += 1
+        self._increment_stat("recoveries_triggered")
         self._record_disconnect(endpoint, state, attempt, reason)
 
     def _record_recovery(
@@ -3062,13 +3250,23 @@ class ResilientProxy:
         mode: str,
     ) -> None:
         if state.recovery_triggered:
-            self.stats["recoveries_succeeded"] += 1
+            self._increment_stat("recoveries_succeeded")
+        self.recovery_outcomes.record(self._recovery_chain_key(state), "recovered")
         detail = (
             f"{_endpoint_label(endpoint)} | recovered via {mode} after {attempt} retr"
             f"{'y' if attempt == 1 else 'ies'}"
         )
         if state.accumulated_text:
             detail += f" | delivered {len(state.accumulated_text)} chars"
+        meta = self._recovery_chain_meta(state)
+        meta.update(
+            {
+                "attempt": attempt,
+                "mode": mode,
+                "delivered_chars": len(state.accumulated_text),
+                "recovery_duration_ms": int((time.time() - state.start_time) * 1000),
+            }
+        )
         self.event_history.add(
             "recovered",
             "Connection recovered",
@@ -3076,19 +3274,21 @@ class ResilientProxy:
             endpoint=endpoint,
             model=state.model,
             tone="success",
-            meta={
-                "attempt": attempt,
-                "mode": mode,
-                "delivered_chars": len(state.accumulated_text),
-                "recovery_duration_ms": int((time.time() - state.start_time) * 1000),
-                "request_summary": state.request_summary,
-            },
+            meta=meta,
         )
 
     def _record_failure(self, endpoint: str, state: StreamState, reason: str) -> None:
+        self.recovery_outcomes.record(self._recovery_chain_key(state), "failed")
         detail = f"{_endpoint_label(endpoint)} | {_shorten_text(reason, 112)}"
         if state.accumulated_text:
             detail += f" | buffered {len(state.accumulated_text)} chars"
+        meta = self._recovery_chain_meta(state)
+        meta.update(
+            {
+                "buffered_chars": len(state.accumulated_text),
+                "reason": reason,
+            }
+        )
         self.event_history.add(
             "failed",
             "Recovery failed",
@@ -3096,11 +3296,7 @@ class ResilientProxy:
             endpoint=endpoint,
             model=state.model,
             tone="danger",
-            meta={
-                "buffered_chars": len(state.accumulated_text),
-                "reason": reason,
-                "request_summary": state.request_summary,
-            },
+            meta=meta,
         )
 
     def _build_proxy_error_response(self, message: str, *, status: int = 504) -> web.Response:
@@ -3143,8 +3339,8 @@ class ResilientProxy:
         )
         state = StreamState(
             model=str(session.get("model", "")).strip(),
-            request_summary=str(session.get("request_summary", "")).strip(),
         )
+        self._bind_session_identity(state, session)
         self.recovery_store.track_active_session(session, state)
         return session, state
 
@@ -3215,7 +3411,7 @@ class ResilientProxy:
                 if attempt > 0:
                     self._record_recovery(endpoint, state, attempt, "request retry")
                 if upstream_response.status < 500:
-                    self.stats["success"] += 1
+                    self._increment_stat("success")
                 return web.Response(
                     body=payload,
                     status=upstream_response.status,
@@ -3339,7 +3535,7 @@ class ResilientProxy:
                     if attempt > 0:
                         self._record_recovery(endpoint, state, attempt, "request retry")
                     if upstream_response.status < 500:
-                        self.stats["success"] += 1
+                        self._increment_stat("success")
                     return web.Response(
                         body=payload,
                         status=upstream_response.status,
@@ -3363,7 +3559,7 @@ class ResilientProxy:
                     self.recovery_store.mark_completed(session, state)
                     if attempt > 0:
                         self._record_recovery(endpoint, state, attempt, "request retry")
-                    self.stats["success"] += 1
+                    self._increment_stat("success")
                     return web.Response(
                         body=b"",
                         status=upstream_response.status,
@@ -3402,7 +3598,7 @@ class ResilientProxy:
                 self.recovery_store.mark_completed(session, state)
                 if attempt > 0:
                     self._record_recovery(endpoint, state, attempt, "request retry")
-                self.stats["success"] += 1
+                self._increment_stat("success")
                 return downstream
             except _RetryableRequestError as exc:
                 last_error = str(exc)
@@ -3806,7 +4002,7 @@ class ResilientProxy:
         return False
 
     async def handle_catchall(self, req: web.Request) -> web.StreamResponse:
-        self.stats["total"] += 1
+        self._increment_stat("total")
         upstream = self.settings_manager.current_upstream
         if not upstream:
             return web.json_response(
@@ -3840,7 +4036,7 @@ class ResilientProxy:
         async with aiohttp.ClientSession() as session:
             async with session.post(url, json=body, headers=headers) as response:
                 payload = await response.read()
-                self.stats["success"] += 1
+                self._increment_stat("success")
                 return web.Response(
                     body=payload,
                     status=response.status,
@@ -3865,7 +4061,7 @@ class ResilientProxy:
             client_label=_request_client_label(req),
             request_title=request_title,
         )
-        state.request_summary = str(session.get("request_summary", "")).strip()
+        self._bind_session_identity(state, session)
         self.recovery_store.track_active_session(session, state)
 
         response = web.StreamResponse(
@@ -3900,7 +4096,7 @@ class ResilientProxy:
                     if attempt > 0:
                         state.is_first_attempt = False
                         state.skip_prefix = state.accumulated_text
-                        self.stats["retry_attempts"] += 1
+                        self._increment_stat("retry_attempts")
                         attempt_body = deepcopy(body)
                         attempt_body["messages"] = deepcopy(original_messages)
                         if not prefill_disabled and _has_non_whitespace_text(state.accumulated_text):
@@ -3929,7 +4125,7 @@ class ResilientProxy:
 
                     state.last_visible_output_at = time.monotonic()
                     if await self._stream_messages(upstream, attempt_body, attempt_headers, state, client_stream, session):
-                        self.stats["success"] += 1
+                        self._increment_stat("success")
                         self.recovery_store.mark_completed(session, state)
                         self._register_pending_tool_wait("/v1/messages", session, state)
                         if attempt > 0:
@@ -4022,7 +4218,7 @@ class ResilientProxy:
             client_label=_request_client_label(req),
             request_title=request_title,
         )
-        state.request_summary = str(session.get("request_summary", "")).strip()
+        self._bind_session_identity(state, session)
         self.recovery_store.track_active_session(session, state)
 
         response = web.StreamResponse(
@@ -4056,7 +4252,7 @@ class ResilientProxy:
                     if attempt > 0:
                         state.is_first_attempt = False
                         state.skip_prefix = state.accumulated_text
-                        self.stats["retry_attempts"] += 1
+                        self._increment_stat("retry_attempts")
                         log.warning(
                             "   RETRY #%s | %s chars accumulated | response_id=%s | -> %s (%s)",
                             attempt,
@@ -4069,7 +4265,7 @@ class ResilientProxy:
 
                     state.last_visible_output_at = time.monotonic()
                     if await self._stream_responses(upstream, attempt_body, attempt_headers, state, client_stream, session):
-                        self.stats["success"] += 1
+                        self._increment_stat("success")
                         self.recovery_store.mark_completed(session, state)
                         self._register_pending_tool_wait("/v1/responses", session, state)
                         if attempt > 0:
@@ -4137,7 +4333,7 @@ class ResilientProxy:
                     return response
 
                 if await self._recover_response_tail(upstream, attempt_headers, state, client_stream):
-                    self.stats["success"] += 1
+                    self._increment_stat("success")
                     self.recovery_store.mark_completed(session, state)
                     self._record_recovery("/v1/responses", state, attempt, "tail fetch")
                     elapsed = time.time() - state.start_time
@@ -4169,7 +4365,7 @@ class ResilientProxy:
             client_label=_request_client_label(req),
             request_title=request_title,
         )
-        state.request_summary = str(session.get("request_summary", "")).strip()
+        self._bind_session_identity(state, session)
         self.recovery_store.track_active_session(session, state)
 
         response = web.StreamResponse(
@@ -4204,7 +4400,7 @@ class ResilientProxy:
                     if attempt > 0:
                         state.is_first_attempt = False
                         state.skip_prefix = state.accumulated_text
-                        self.stats["retry_attempts"] += 1
+                        self._increment_stat("retry_attempts")
                         attempt_body = deepcopy(body)
                         attempt_body["messages"] = deepcopy(original_messages)
                         if not prefill_disabled and _has_non_whitespace_text(state.accumulated_text):
@@ -4232,7 +4428,7 @@ class ResilientProxy:
 
                     state.last_visible_output_at = time.monotonic()
                     if await self._stream_chat_completions(upstream, attempt_body, attempt_headers, state, client_stream, session):
-                        self.stats["success"] += 1
+                        self._increment_stat("success")
                         self.recovery_store.mark_completed(session, state)
                         self._register_pending_tool_wait("/v1/chat/completions", session, state)
                         if attempt > 0:
@@ -5809,6 +6005,7 @@ async def run_proxy(args: argparse.Namespace) -> int:
         await settings_manager.start_watch()
 
     async def on_cleanup(_app: web.Application) -> None:
+        proxy.persistent_stats.flush(force=True)
         await settings_manager.stop_watch()
         cleanup()
 
